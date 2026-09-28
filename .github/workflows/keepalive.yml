@@ -1,0 +1,17 @@
+name: Supabase Keep-Alive
+
+on:
+  schedule:
+    - cron: '0 3 * * 1,4'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase so the free-tier project doesn't pause from inactivity
+        run: |
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            "https://wvolctqklbmmlzosexel.supabase.co/rest/v1/app_state?select=id&limit=1" \
+            -H "apikey: sb_publishable_xRdm-EvBqyln-ZLp0A6vTA_ghRiKtzT" \
+            -H "Authorization: Bearer sb_publishable_xRdm-EvBqyln-ZLp0A6vTA_ghRiKtzT"
