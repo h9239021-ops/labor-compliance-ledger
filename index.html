@@ -138,6 +138,49 @@
   .cat-body{padding:14px 16px 16px;display:flex;flex-direction:column;gap:12px;}
   .empty-row{font-size:12.5px;color:var(--ink-300);padding:6px 2px;}
 
+  /* ---------- 근로감독 안내 tab ---------- */
+  .intro-text{font-size:13.5px;color:var(--ink-700);line-height:1.85;margin-top:6px;}
+  .intro-text + .intro-text{margin-top:10px;}
+
+  .type-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:14px;}
+  .type-card{border:1px solid var(--line-soft);border-radius:10px;padding:13px 14px;background:var(--paper-50);}
+  .type-card .tname{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:13.5px;color:var(--accent-900);margin-bottom:6px;}
+  .type-card .tname .dot{width:7px;height:7px;border-radius:50%;background:var(--accent-500);}
+  .type-card p{margin:0;font-size:12.3px;color:var(--ink-700);line-height:1.65;}
+  .type-card .tag{display:inline-block;margin-top:8px;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:100px;background:var(--accent-100);color:var(--accent-700);}
+  .type-card.special .tag{background:var(--danger-100);color:var(--danger-700);}
+
+  .flow{margin-top:16px;position:relative;padding-left:26px;}
+  .flow::before{content:"";position:absolute;left:11px;top:6px;bottom:6px;width:2px;background:var(--line);}
+  .flow-step{position:relative;padding-bottom:22px;}
+  .flow-step:last-child{padding-bottom:0;}
+  .flow-num{position:absolute;left:-26px;top:0;width:24px;height:24px;border-radius:50%;background:var(--accent-700);color:#fff;font-weight:700;font-size:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 4px var(--paper-0);}
+  .flow-card{background:var(--paper-50);border:1px solid var(--line-soft);border-radius:10px;padding:11px 14px;}
+  .flow-card .ft{font-weight:700;font-size:13.5px;color:var(--ink-900);display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .flow-card .fref{font-size:10.5px;font-weight:700;color:var(--ink-500);background:var(--surface);border:1px solid var(--line);padding:1px 7px;border-radius:100px;}
+  .flow-card .fd{font-size:12.3px;color:var(--ink-700);margin-top:5px;line-height:1.65;}
+  .flow-branch{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;}
+  .flow-branch .bopt{flex:1;min-width:170px;border-radius:8px;padding:8px 10px;font-size:11.8px;line-height:1.55;}
+  .flow-branch .bopt.ok{background:var(--good-100);color:var(--good-700);}
+  .flow-branch .bopt.no{background:var(--danger-100);color:var(--danger-700);}
+  .flow-branch .bopt b{display:block;font-size:12px;margin-bottom:2px;}
+
+  details.subcat{border:1px solid var(--line-soft);border-radius:9px;margin-bottom:8px;overflow:hidden;background:var(--paper-50);}
+  details.subcat > summary{list-style:none;cursor:pointer;padding:9px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;font-weight:700;color:var(--ink-900);}
+  details.subcat > summary::-webkit-details-marker{display:none;}
+  details.subcat .subcat-chevron{transition:transform .15s ease;color:var(--ink-300);font-size:11px;}
+  details.subcat[open] .subcat-chevron{transform:rotate(90deg);}
+  details.subcat .subcat-body{padding:0 12px 12px;}
+
+  .checklist-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 14px;margin-top:2px;}
+  .checklist-grid .ci{display:flex;align-items:flex-start;gap:7px;font-size:12.3px;color:var(--ink-700);line-height:1.6;}
+  .checklist-grid .ci input[type="checkbox"]{margin:2px 0 0;flex:none;width:15px;height:15px;accent-color:var(--accent-700);cursor:pointer;}
+  .checklist-grid .ci label{cursor:pointer;}
+  .checklist-grid .ci input[type="checkbox"]:checked ~ label{color:var(--ink-300);text-decoration:line-through;}
+  .sanction-note{font-size:12.5px;color:var(--ink-700);line-height:1.75;background:var(--paper-50);border:1px solid var(--line-soft);border-radius:8px;padding:10px 12px;}
+  .sanction-note ul{margin:0;padding-left:18px;}
+  .sanction-note li{margin-bottom:3px;}
+
   .attach-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;}
   .attach-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid var(--line-soft);border-radius:8px;font-size:12.5px;background:var(--surface);}
   .attach-item a{color:var(--accent-700);text-decoration:none;}
