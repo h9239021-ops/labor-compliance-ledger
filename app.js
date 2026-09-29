@@ -135,9 +135,6 @@
     if (bytes < 1024*1024) return Math.round(bytes/1024) + "KB";
     return (bytes/1024/1024).toFixed(1) + "MB";
   }
-  async function getSampleApi(){
-    try { return (typeof window !== "undefined" && window.claude) ? await window.claude.use("sample") : null; } catch(e){ return null; }
-  }
   // Real Supabase Storage accepts any file type/size (within the bucket's limits),
   // so unlike the old Artifact-based uploader there is no extension allowlist here —
   // this is one of the main reasons for the migration off the Artifact page.
@@ -204,7 +201,14 @@
     }
     return text.slice(0, maxChars);
   }
-  async function extractFindingsFromAttachments(attachments, sample){
+  // AI extraction runs server-side via the "analyze-inspection-doc" Supabase Edge
+  // Function (see supabase/functions/analyze-inspection-doc/index.ts). This app used
+  // to run inside a claude.ai artifact, where `window.claude.use("sample")` could ask
+  // Claude directly from the browser — that API only exists inside the artifact
+  // iframe, so after moving to a standalone site (GitHub Pages) it silently stopped
+  // working. The Edge Function keeps the Anthropic API key server-side and checks
+  // that the caller is a logged-in, registered editor before spending any AI budget.
+  async function extractFindingsFromAttachments(attachments){
     var imageBlobs = [];
     var textParts = [];
     for (var i=0;i<attachments.length;i++){
@@ -236,17 +240,27 @@
       "- correctionDeadline: 개선기한 (YYYY-MM-DD), 있으면\n" +
       "- violationDesc: 위반/지적 내용 요약\n" +
       "- correctionPlan: 개선방안 (자료에 명시되어 있으면)\n\n" +
-      "반드시 아래 JSON 형식으로만 답변하세요 (다른 설명 문장 없이): " +
+      "반드시 아래 JSON 형식으로만 답변하세요 (다른 설명 문장이나 마크다운 코드블록 없이 순수 JSON만): " +
       '{"items":[{"categoryName":"","severity":"","lawRef":"","foundDate":"","disposition":"","dispositionAmount":null,"fineImposed":"","correctionDeadline":"","violationDesc":"","correctionPlan":""}]}' + "\n\n" +
       (textParts.length ? ("--- 첨부 텍스트 내용 ---\n" + textParts.join("\n\n").slice(0, 50000)) : "(텍스트 자료 없음 — 첨부된 이미지를 참고해 분석하세요)");
 
-    var opts = {};
-    if (imageBlobs.length){
-      var limits = null;
-      try { limits = await sample.limits(); } catch(e){ limits = null; }
-      if (limits && limits.images) opts.images = imageBlobs;
+    var fd = new FormData();
+    fd.append("prompt", promptText);
+    imageBlobs.slice(0, 5).forEach(function(blob){ fd.append("image", blob, blob.name || "image"); });
+
+    var res = await sb.functions.invoke("analyze-inspection-doc", { body: fd });
+    if (res.error){
+      var detail = "";
+      try { if (res.error.context && typeof res.error.context.json === "function"){ var body = await res.error.context.json(); detail = body && body.error ? body.error : ""; } } catch(e){}
+      throw new Error(detail || res.error.message || "AI 분석 요청에 실패했습니다.");
     }
-    return await sample.json(promptText, opts);
+    if (res.data && res.data.error) throw new Error(res.data.error);
+    var raw = res.data && res.data.text;
+    if (!raw) throw new Error("AI 응답이 비어 있습니다.");
+    var jsonStr = raw.trim();
+    var m = jsonStr.match(/\{[\s\S]*\}/);
+    if (m) jsonStr = m[0];
+    return JSON.parse(jsonStr);
   }
   function matchCategoryByName(name){
     if (!name) return state.categories[0] ? state.categories[0].id : "";
@@ -998,10 +1012,9 @@
   // commit message used when there's nothing to auto-fill (or the user declines);
   // when the user accepts, the AI-filled item count is appended to it.
   async function processRoundAttachmentsForAutofill(round, attachmentsWithFiles, baseCommitMsg){
-    var sample = await getSampleApi();
-    if (!sample){
+    if (!sb){
       commit(baseCommitMsg);
-      toast("첨부파일이 저장되었습니다. 이 화면에서는 AI 자동인식을 사용할 수 없어 적발 이력은 직접 입력해주세요.");
+      toast("첨부파일이 저장되었습니다. 저장소 연결이 없어 AI 자동인식을 사용할 수 없습니다.");
       return;
     }
     var recognizable = attachmentsWithFiles.filter(function(a){ var ext = extOf(a.name); return a.file && (ext === "pdf" || IMAGE_EXTS.indexOf(ext) !== -1); });
@@ -1012,7 +1025,7 @@
     }
     toast("첨부파일 내용을 분석하는 중입니다...");
     try {
-      var extracted = await extractFindingsFromAttachments(recognizable, sample);
+      var extracted = await extractFindingsFromAttachments(recognizable);
       var items = (extracted && extracted.items) ? extracted.items.filter(function(it){ return it && (it.violationDesc || it.lawRef); }) : [];
       if (!items.length){
         commit(baseCommitMsg);
@@ -1022,14 +1035,13 @@
       showAutofillConfirm(round, items, baseCommitMsg);
     } catch(err){
       commit(baseCommitMsg);
-      var code = err && err.code;
-      var msg = code === "not_granted" ? "AI 자동인식 사용 권한이 없어" : code === "rate_limited" ? "요청이 많아 AI 자동인식을 사용하지 못해" : "AI 자동인식 중 오류가 발생하여";
-      toast("첨부파일이 저장되었습니다. " + msg + " 적발 이력은 직접 입력해주세요.");
+      var msg = (err && err.message) ? err.message : "AI 자동인식 중 오류가 발생했습니다";
+      toast("첨부파일이 저장되었습니다. " + msg + " — 적발 이력은 직접 입력해주세요.");
     }
   }
   function showAutofillConfirm(round, items, baseCommitMsg){
-    var body = '<h3>AI 자동 입력 확인</h3>' +
-      '<p class="hint">첨부파일에서 <b>' + items.length + '건</b>의 적발/지적 사항을 인식했습니다. 근로감독 이력에 자동으로 채워넣을까요? 자동 입력 후에도 각 항목은 직접 수정할 수 있습니다.</p>' +
+    var body = '<h3>이 자료로 이력을 자동 등록하시겠습니까?</h3>' +
+      '<p class="hint">첨부파일에서 <b>' + items.length + '건</b>의 적발/지적 사항을 인식했습니다. 아래 내용을 근로감독 이력에 자동으로 등록할까요? 등록 후에도 각 항목은 직접 수정할 수 있습니다.</p>' +
       '<div style="max-height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin:10px 0;">' +
       items.map(function(it){
         return '<div class="item-card" style="padding:9px 11px;">' +
