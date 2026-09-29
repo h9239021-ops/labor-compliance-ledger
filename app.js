@@ -235,7 +235,7 @@
       "- lawRef: 근거법령/조항\n" +
       "- foundDate: 감독일 또는 적발일 (YYYY-MM-DD)\n" +
       "- disposition: 처분결과 (예: 과태료, 시정지시, 사법처리 등)\n" +
-      "- dispositionAmount: 처분금액(만원 단위 숫자), 없으면 null\n" +
+      "- dispositionAmount: 처분금액을 반드시 \"만원\" 단위 숫자로 변환해서 기입 (예: 자료에 \"3,951,983원\"이라고 적혀 있으면 3951983이 아니라 395.1983으로, \"195,000원\"이면 195000이 아니라 19.5로 변환. 절대 원(₩) 단위 그대로 넣지 말 것), 없으면 null\n" +
       "- fineImposed: \"부과\" 또는 \"미부과\"\n" +
       "- correctionDeadline: 개선기한 (YYYY-MM-DD), 있으면\n" +
       "- violationDesc: 위반/지적 내용 요약\n" +
