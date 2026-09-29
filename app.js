@@ -231,7 +231,7 @@
       "사용 가능한 카테고리 목록: " + catNames.join(", ") + "\n\n" +
       "각 적발 항목마다 다음 필드를 채워주세요 (알 수 없는 값은 빈 문자열 또는 null로 두세요):\n" +
       "- categoryName: 위 카테고리 목록 중 가장 가까운 것 하나\n" +
-      "- severity: \"시정명령\" 또는 \"개선권고\" 중 하나 (실제 위반으로 시정을 지시받은 것이면 시정명령, 문제 소지는 있으나 감독기관이 정식으로 문제삼지 않고 권고만 한 것이면 개선권고)\n" +
+      "- severity: \"시정명령\", \"시정지시\", \"개선권고\" 중 하나 (자료에 '시정명령'이라는 표현이 명시되어 있으면 시정명령, '시정지시'라는 표현이 명시되어 있거나 일반적인 시정조치 통보이면 시정지시, 실제 위반으로 공식 처분된 것이 아니라 감독관이 리스크로 지적만 하고 시정지시서/명령서에는 최종 포함되지 않은 사항이면 개선권고)\n" +
       "- lawRef: 근거법령/조항\n" +
       "- foundDate: 감독일 또는 적발일 (YYYY-MM-DD)\n" +
       "- disposition: 처분결과 (예: 과태료, 시정지시, 사법처리 등)\n" +
@@ -536,11 +536,11 @@
     var openCount = openIssuesList().length;
     var watch = riskWatchlist();
     var overdue = overdueList();
-    var watchStrict = watch.filter(function(i){ return i.severity === "시정명령"; });
-    var watchAdvisory = watch.filter(function(i){ return i.severity !== "시정명령"; });
-    var overdueStrict = overdue.filter(function(i){ return i.severity === "시정명령"; });
-    var overdueAdvisory = overdue.filter(function(i){ return i.severity !== "시정명령"; });
-    var strictTotal = state.inspections.filter(function(i){return i.severity==="시정명령";}).length;
+    var watchStrict = watch.filter(function(i){ return i.severity !== "개선권고"; });
+    var watchAdvisory = watch.filter(function(i){ return i.severity === "개선권고"; });
+    var overdueStrict = overdue.filter(function(i){ return i.severity !== "개선권고"; });
+    var overdueAdvisory = overdue.filter(function(i){ return i.severity === "개선권고"; });
+    var strictTotal = state.inspections.filter(function(i){return i.severity!=="개선권고";}).length;
     var advisoryTotal = state.inspections.filter(function(i){return i.severity==="개선권고";}).length;
     var lr = latestRound();
     var nextCheckDue = lr ? addMonths(lr.date, state.meta.selfCheckIntervalMonths) : null;
@@ -554,14 +554,14 @@
     }
     html += '<div class="grid-stats">';
     html += statCard("최근 근로감독일", lastInsp ? fmtDate(lastInsp) : "이력 없음", "");
-    html += statCard("누적 적발 건수", String(strictTotal) + '<small>건</small>', "시정지시 기준 · 개선권고 " + advisoryTotal + "건은 별도 관리(전체 " + state.inspections.length + "건)");
+    html += statCard("누적 적발 건수", String(strictTotal) + '<small>건</small>', "시정지시·시정명령 기준 · 개선권고 " + advisoryTotal + "건은 별도 관리(전체 " + state.inspections.length + "건)");
     html += '<div class="stat" id="statOpenIssues" style="cursor:pointer;" title="클릭해서 목록 보기"><div class="label">미개선 건수</div><div class="value">' + openCount + '<small>건</small></div><div class="sub">진행중·미착수 합계 · 클릭해서 목록 보기 ↗</div></div>';
     html += '<div class="stat" id="statNextCheck" style="cursor:pointer;" title="클릭해서 가장 최근 모의점검 내역 보기"><div class="label">다음 모의점검 권장일</div><div class="value">' + (nextCheckDue ? fmtDate(nextCheckDue) : "미실시") + '</div><div class="sub">' + esc(lr ? ("최근 " + lr.roundLabel + " · 위험 " + dangerCats + " / 주의 " + watchCats + " · 클릭해서 보기 ↗") : "아직 등록된 점검 없음") + '</div></div>';
     html += '</div>';
 
     html += '<div class="grid-stats">';
-    html += statCard("가중처벌 적용기간 내 미개선", String(watchStrict.length) + '<small>건</small>', "시정지시 기준 · 적발일로부터 재적발 기준기간 이내 · 재적발 시 처벌 가중 위험", watchStrict.length>0);
-    html += statCard("개선기한 초과", String(overdueStrict.length) + '<small>건</small>', "시정지시 기준 · 시정 완료가 지연되고 있는 항목", overdueStrict.length>0);
+    html += statCard("가중처벌 적용기간 내 미개선", String(watchStrict.length) + '<small>건</small>', "시정지시·시정명령 기준 · 적발일로부터 재적발 기준기간 이내 · 재적발 시 처벌 가중 위험", watchStrict.length>0);
+    html += statCard("개선기한 초과", String(overdueStrict.length) + '<small>건</small>', "시정지시·시정명령 기준 · 시정 완료가 지연되고 있는 항목", overdueStrict.length>0);
     html += '</div>';
 
     var watchLi = function(i){
@@ -573,7 +573,7 @@
     if (!watch.length){
       html += '<div class="empty-row">해당 항목이 없습니다.</div>';
     } else {
-      html += severityGroupBlock("시정지시", watchStrict, watchLi) + severityGroupBlock("개선권고", watchAdvisory, watchLi);
+      html += severityGroupBlock("시정지시/시정명령", watchStrict, watchLi) + severityGroupBlock("개선권고", watchAdvisory, watchLi);
     }
     html += '</div>';
 
@@ -583,7 +583,7 @@
           '<span class="badge danger">기한 ' + fmtDate(i.correctionDeadline) + ' 초과</span></li>';
       };
       html += '<div class="panel"><div class="panel-head"><div><h2>개선기한 초과 항목</h2><div class="desc">개선기한을 넘겼지만 아직 완료 처리되지 않은 항목입니다. (시정지시와 개선권고 구분 표기)</div></div></div>';
-      html += severityGroupBlock("시정지시", overdueStrict, overdueLi) + severityGroupBlock("개선권고", overdueAdvisory, overdueLi);
+      html += severityGroupBlock("시정지시/시정명령", overdueStrict, overdueLi) + severityGroupBlock("개선권고", overdueAdvisory, overdueLi);
       html += '</div>';
     }
 
@@ -609,15 +609,15 @@
   function openIssuesListGrouped(){
     var list = openIssuesList();
     return {
-      strict: list.filter(function(i){ return i.severity === "시정명령"; }),
-      advisory: list.filter(function(i){ return i.severity !== "시정명령"; })
+      strict: list.filter(function(i){ return i.severity !== "개선권고"; }),
+      advisory: list.filter(function(i){ return i.severity === "개선권고"; })
     };
   }
   function openOpenIssuesModal(){
     var grouped = openIssuesListGrouped();
     var total = grouped.strict.length + grouped.advisory.length;
     var body = '<h3>미개선 적발사항 (' + total + '건)</h3>' +
-      '<p class="hint" style="margin-top:2px;">시정지시(실제 적발)와 개선권고(권고사항)는 재적발 시 위험수준이 달라 구분해 표기합니다.</p>';
+      '<p class="hint" style="margin-top:2px;">시정지시/시정명령(실제 적발)과 개선권고(권고사항)는 재적발 시 위험수준이 달라 구분해 표기합니다.</p>';
     if (!total){
       body += '<p class="hint">미개선 항목이 없습니다.</p>';
     } else {
@@ -626,7 +626,7 @@
           '<span class="mono" style="font-size:11.5px;color:var(--ink-500);flex:none;">' + fmtDate(i.foundDate) + '</span></li>';
       };
       body += '<div style="max-height:420px;overflow-y:auto;">' +
-        severityGroupBlock("시정지시", grouped.strict, renderIssueLi) +
+        severityGroupBlock("시정지시/시정명령", grouped.strict, renderIssueLi) +
         severityGroupBlock("개선권고", grouped.advisory, renderIssueLi) +
       '</div>';
     }
@@ -692,6 +692,15 @@
     var html = '<div class="panel-head" style="margin-top:0;"><div><h2 style="font-size:19px;">적발 사항</h2><div class="desc">근로감독에서 적발된 사항을 한 줄씩 빠르게 기록·조회하는 목록입니다. 근거법령·개선방안·자료 링크 등 자세한 내용은 항목을 열어 입력합니다.</div></div>' +
       (editMode ? '<button class="btn primary sm" id="btnAddFinding">+ 새 적발사항 추가</button>' : '') + '</div>';
 
+    html += '<details class="cat" style="margin-bottom:12px;"><summary><span class="cat-title"><span class="cat-chevron">▸</span>시정지시 · 시정명령 · 개선권고란?</span></summary>' +
+      '<div class="cat-body" style="font-size:13px;line-height:1.6;color:var(--ink-700);">' +
+        '<div><b>시정지시</b> — 근로감독 결과 법 위반사항이 확인되었을 때, 근로감독관이 사업주에게 일정 기한 내 스스로 고치도록 통보하는 행정지도 성격의 1차 조치입니다. 통상 "시정지시서"로 서면 통보되며, 기한 내 이행하면 별도 처벌 없이 종결됩니다.</div>' +
+        '<div><b>시정명령</b> — 관계법령에 근거해 고용노동관서장이 발하는 보다 공식적인 처분으로, 시정지시보다 강한 행정조치입니다. 기한까지 이행하지 않으면 과태료 부과나 사법처리로 이어질 수 있습니다. (실무상 두 용어가 혼용되기도 하니 실제 통지서상의 명칭을 함께 확인하는 것이 좋습니다.)</div>' +
+        '<div><b>개선권고</b> — 근로감독 과정에서 감독관이 리스크로 지적하였지만, 시정지시서·시정명령서에는 최종 포함되지 않은 사항입니다. 공식 처분은 아니지만 향후 동일 사안이 재적발될 경우를 대비해 관리 유의가 필요합니다.</div>' +
+        '<div style="color:var(--ink-500);font-size:12px;">※ 위 구분은 일반적인 행정 실무 기준이며, 개별 사안의 정확한 법적 성격은 실제 통지서 문구와 담당 노무사·변호사 확인을 통해 판단하시기 바랍니다.</div>' +
+      '</div>' +
+    '</details>';
+
     var all = state.inspections;
     var list = all.slice();
     if (findingsFilter.severity !== "all") list = list.filter(function(i){ return i.severity === findingsFilter.severity; });
@@ -699,7 +708,7 @@
     list.sort(function(a,b){ return (b.foundDate||"").localeCompare(a.foundDate||""); });
 
     html += '<div class="panel" style="padding:14px 16px;display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">' +
-      filterSelect("항목구분", "filterSeverity", findingsFilter.severity, [["all","전체"],["시정명령","시정명령"],["개선권고","개선권고"]]) +
+      filterSelect("항목구분", "filterSeverity", findingsFilter.severity, [["all","전체"],["시정명령","시정명령"],["시정지시","시정지시"],["개선권고","개선권고"]]) +
       filterSelect("개선여부", "filterStatus", findingsFilter.status, [["all","전체"],["미착수","미착수"],["진행중","진행중"],["개선완료","개선완료"]]) +
       (list.length !== all.length ? '<span class="badge neutral">' + list.length + ' / ' + all.length + '건 표시 중</span>' : '') +
       ((findingsFilter.severity !== "all" || findingsFilter.status !== "all") ? '<button class="btn sm ghost" id="btnResetFilter">필터 초기화</button>' : '') +
@@ -716,7 +725,7 @@
     } else {
       list.forEach(function(i){
         var flags = computeInspectionFlags(i);
-        var sevBadge = i.severity === "시정명령" ? '<span class="badge danger">시정명령</span>' : '<span class="badge warn">개선권고</span>';
+        var sevBadge = severityBadge(i.severity);
         var statusBadge = i.status === "개선완료" ? '<span class="badge good">개선완료</span>' : (flags.overdue ? '<span class="badge danger">기한초과</span>' : '<span class="badge neutral">' + esc(i.status) + '</span>');
         html += '<tr>' +
           '<td>' + sevBadge + '</td>' +
@@ -754,6 +763,11 @@
       });
     }
     bindDeleteInspection(el);
+  }
+  function severityBadge(sev){
+    if (sev === "시정명령") return '<span class="badge danger">시정명령</span>';
+    if (sev === "시정지시") return '<span class="badge info">시정지시</span>';
+    return '<span class="badge warn">개선권고</span>';
   }
   function filterSelect(label, id, val, options){
     var opts = options.map(function(o){ return '<option value="' + o[0] + '"' + (o[0]===val?" selected":"") + '>' + o[1] + '</option>'; }).join("");
@@ -1064,7 +1078,7 @@
         var obj = {
           id: uid(), createdAt: new Date().toISOString(), links: [], correctionEvidenceFiles: [],
           categoryId: catId, roundId: round.id, inspectionRound: round.label,
-          severity: (it.severity === "개선권고" ? "개선권고" : "시정명령"),
+          severity: (it.severity === "개선권고" ? "개선권고" : (it.severity === "시정지시" ? "시정지시" : "시정명령")),
           lawRef: it.lawRef || "", foundDate: it.foundDate || round.date || todayStr(),
           inspectionType: round.type || "정기", status: "미착수",
           disposition: it.disposition || "", dispositionAmount: it.dispositionAmount ? Number(it.dispositionAmount) : null,
@@ -1088,7 +1102,7 @@
       html += '<div class="panel-head" style="margin-top:14px;"><div><h2 style="font-size:14px;">첨부목록</h2></div></div>';
       html += renderAttachmentList(round.attachments, editMode ? "del-round-attach" : null, round.id);
     }
-    html += '<div class="panel-head" style="margin-top:14px;"><div><h2 style="font-size:14px;">이 시기 관련 자료 (최종 제출자료 / 시정지시서 / 최종 보고자료)</h2></div></div>';
+    html += '<div class="panel-head" style="margin-top:14px;"><div><h2 style="font-size:14px;">이 시기 관련 자료 (제출자료 / 시정지시서·명령서 / 보고자료 등)</h2></div></div>';
     var mats = round.materials || [];
     html += '<div class="scrollx"><table class="tbl"><thead><tr><th>구분</th><th>자료명</th><th>파일/링크</th><th>등록일</th><th>비고</th>' + (editMode?'<th></th>':'') + '</tr></thead><tbody>';
     if (!mats.length){
@@ -1112,8 +1126,8 @@
   }
   function roundMaterialForm(){
     return '<form class="f" id="roundMaterialForm">' +
-      selectField("구분 *", 'kind', "최종 제출자료", [["최종 제출자료","최종 제출자료"],["시정지시서","시정지시서"],["최종 보고자료","최종 보고자료"],["기타","기타"]]) +
-      field("자료명 *", 'input', 'name', "", 'text', '예: 2026년 정기감독 최종 제출자료') +
+      selectField("구분 *", 'kind', "제출자료", [["제출자료","제출자료"],["시정지시서/명령서","시정지시서/명령서"],["보고자료(내부용)","보고자료(내부용)"],["보고자료(노동부)","보고자료(노동부)"],["기타","기타"]]) +
+      field("자료명 *", 'input', 'name', "", 'text', '예: 2026년 정기감독 제출자료') +
       '<div class="full">' +
         '<label style="margin-bottom:4px;display:block;">파일 업로드 (모든 파일 형식 가능 — PDF/이미지는 AI 자동인식 지원)</label>' +
         '<div style="display:flex;align-items:center;gap:8px;">' +
@@ -1217,7 +1231,7 @@
 
   function inspectionCard(i){
     var flags = computeInspectionFlags(i);
-    var sevBadge = i.severity === "시정명령" ? '<span class="badge danger">시정명령</span>' : '<span class="badge warn">개선권고</span>';
+    var sevBadge = severityBadge(i.severity);
     var statusBadge = i.status === "개선완료" ? '<span class="badge good">개선완료</span>' : (flags.overdue ? '<span class="badge danger">기한초과</span>' : '<span class="badge neutral">' + esc(i.status) + '</span>');
     var repeatBadge = (i.status !== "개선완료" && flags.withinWindow) ? '<span class="badge warn">재적발 위험 · D-' + daysUntil(flags.repeatDeadline) + '</span>' : '';
     var editBtns = editMode ? '<div class="item-actions"><button class="btn sm" data-edit-insp="' + i.id + '">수정</button><button class="btn sm danger" data-del-insp="' + i.id + '">삭제</button></div>' : '';
@@ -1241,8 +1255,8 @@
         metaField("보고일자", i.reportDate ? fmtDate(i.reportDate) : "-") +
       '</div>' +
       (i.correctionPlan || i.correctionResult ? '<div class="item-meta" style="margin-top:2px;">' +
-        (i.correctionPlan ? '<div class="full"><div class="k">개선방안</div><div class="v" style="white-space:pre-wrap;">' + esc(i.correctionPlan) + '</div></div>' : '') +
-        (i.correctionResult ? '<div class="full"><div class="k">개선결과</div><div class="v" style="white-space:pre-wrap;">' + esc(i.correctionResult) + '</div></div>' : '') +
+        (i.correctionPlan ? '<div class="item-note-block"><div class="k">개선방안</div><div class="v">' + esc(i.correctionPlan) + '</div></div>' : '') +
+        (i.correctionResult ? '<div class="item-note-block"><div class="k">개선결과</div><div class="v">' + esc(i.correctionResult) + '</div></div>' : '') +
       '</div>' : '') +
       (links ? '<div class="links-row">' + links + '</div>' : '') +
       (evidenceFiles ? '<div class="links-row">' + evidenceFiles + '</div>' : '') +
@@ -1271,7 +1285,7 @@
     return (
       '<form class="f" data-insp-id="' + (insp.id||"") + '">' +
         '<label>카테고리 *<select name="categoryId">' + catOpts + '</select></label>' +
-        selectField("항목 구분 *", 'severity', insp.severity, [["시정명령","시정명령"],["개선권고","개선권고"]]) +
+        selectField("항목 구분 *", 'severity', insp.severity, [["시정명령","시정명령"],["시정지시","시정지시"],["개선권고","개선권고"]]) +
         field("근거법령/조항", 'input', 'lawRef', insp.lawRef, 'text', '예: 근로기준법 제17조') +
         field("감독 일시 *", 'input', 'foundDate', insp.foundDate, 'date') +
         selectField("감독구분", 'inspectionType', insp.inspectionType, [["정기","정기감독"],["수시","수시감독"],["특별","특별감독"],["기타","기타"]]) +
@@ -1476,7 +1490,7 @@
     var watch = (state.legalWatchlist||[]).slice();
     var html = '<div class="panel">' +
       '<div class="panel-head"><div><h2 style="font-size:15px;">법령 최신성 검토</h2><div class="desc">체크리스트 근거 법령이 현행 기준과 일치하는지 확인한 이력입니다. 관련 법령이 개정되면 여기에 반영 내역과 확인이 필요한 사항이 쌓입니다.</div></div>' +
-      (editMode ? '<button class="btn sm" id="btnAddLegalItem">+ 법령 변경사항 기록</button>' : '') + '</div>';
+      (editMode ? ('<div style="display:flex;gap:6px;flex:none;"><button class="btn sm" id="btnRefreshLegalReview">⟳ 갱신</button><button class="btn sm" id="btnAddLegalItem">+ 법령 변경사항 기록</button></div>') : '') + '</div>';
     html += '<div class="item-desc" style="color:var(--ink-500);">최근 검토 기준일: <b class="mono">' + (lr.reviewedDate ? fmtDate(lr.reviewedDate) : "-") + '</b>' + (lr.reviewedBy ? (' · ' + esc(lr.reviewedBy)) : '') + '</div>';
 
     if (alerts.length){
@@ -1526,6 +1540,8 @@
     '</form>';
   }
   function bindLegalReviewPanel(el){
+    var refreshBtn = document.getElementById("btnRefreshLegalReview");
+    if (refreshBtn) refreshBtn.addEventListener("click", runLegalReview);
     var addBtn = document.getElementById("btnAddLegalItem");
     var host = document.getElementById("legalItemFormHost");
     if (addBtn && host){
@@ -1563,6 +1579,101 @@
           commit("법령 검토 기록 삭제");
         });
       });
+    });
+  }
+  async function runLegalReview(){
+    var categories = state.categories.map(function(cat){
+      var items = ((state.selfCheckTemplate||{})[cat.id] || []).filter(function(it){ return it.law; });
+      return { categoryId: cat.id, categoryName: cat.name, items: items.map(function(it){ return {id: it.id, text: it.text, law: it.law}; }) };
+    }).filter(function(c){ return c.items.length; });
+
+    if (!categories.length){
+      toast("체크리스트에 근거 법령이 기재된 항목이 없어 갱신할 내용이 없습니다.");
+      return;
+    }
+    if (!sb){
+      toast("저장소 연결이 없어 법령 갱신 기능을 사용할 수 없습니다.");
+      return;
+    }
+    toast("최신 법령을 조회하는 중입니다... (최대 1분 정도 걸릴 수 있습니다)");
+    try {
+      var res = await sb.functions.invoke("review-legal-updates", { body: { categories: categories } });
+      if (res.error){
+        var detail = "";
+        try { if (res.error.context && typeof res.error.context.json === "function"){ var errBody = await res.error.context.json(); detail = errBody && errBody.error ? errBody.error : ""; } } catch(e){}
+        throw new Error(detail || res.error.message || "법령 갱신 요청에 실패했습니다.");
+      }
+      if (res.data && res.data.error) throw new Error(res.data.error);
+      var raw = res.data && res.data.text;
+      if (!raw) throw new Error("AI 응답이 비어 있습니다.");
+      var jsonStr = raw.trim();
+      var m = jsonStr.match(/\{[\s\S]*\}/);
+      if (m) jsonStr = m[0];
+      var result = JSON.parse(jsonStr);
+      var updates = (result.updates || []).filter(function(u){ return u && u.itemId && u.newLaw; });
+      var alerts = (result.alerts || []).filter(function(a){ return a && a.title; });
+      if (!updates.length && !alerts.length){
+        state.meta.lawReview = { reviewedDate: todayStr(), reviewedBy: "AI 자동 갱신" };
+        commit("법령 최신성 검토 (변경사항 없음)");
+        toast("확인 결과 반영이 필요한 변경사항이 없습니다. 검토일이 갱신되었습니다.");
+        return;
+      }
+      showLegalReviewConfirm(updates, alerts);
+    } catch(err){
+      var msg = (err && err.message) ? err.message : "법령 갱신 중 오류가 발생했습니다";
+      toast(msg);
+    }
+  }
+  function showLegalReviewConfirm(updates, alerts){
+    var body = '<h3>법령 갱신 내용을 반영하시겠습니까?</h3>' +
+      '<p class="hint">AI가 웹검색으로 확인한 결과입니다. 내용을 검토한 뒤 반영해주세요.</p>' +
+      '<div style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin:10px 0;">';
+    if (updates.length){
+      body += '<div style="font-size:12.5px;font-weight:700;color:var(--ink-500);">근거 법령 업데이트 (' + updates.length + '건)</div>';
+      updates.forEach(function(u){
+        body += '<div class="item-card" style="padding:9px 11px;">' +
+          '<div style="font-weight:700;font-size:13px;">' + esc(u.categoryName||"") + '</div>' +
+          '<div style="font-size:12.5px;color:var(--ink-500);margin-top:2px;">' + esc(u.oldLaw||"-") + ' → <b>' + esc(u.newLaw||"-") + '</b></div>' +
+          (u.reason ? ('<div style="font-size:12px;color:var(--ink-500);margin-top:2px;">' + esc(u.reason) + '</div>') : '') +
+        '</div>';
+      });
+    }
+    if (alerts.length){
+      body += '<div style="font-size:12.5px;font-weight:700;color:var(--ink-500);margin-top:6px;">신규 반영 내역 (' + alerts.length + '건)</div>';
+      alerts.forEach(function(a){
+        body += '<div class="item-card" style="padding:9px 11px;">' +
+          '<div style="font-weight:700;font-size:13px;">' + esc(a.title||"") + '</div>' +
+          (a.categoryName ? ('<div style="font-size:12px;color:var(--ink-500);">' + esc(a.categoryName) + '</div>') : '') +
+          (a.summary ? ('<div style="font-size:12.5px;color:var(--ink-700);margin-top:2px;">' + esc(a.summary) + '</div>') : '') +
+          (a.effectiveDate ? ('<div style="font-size:12px;color:var(--ink-500);margin-top:2px;">시행일: ' + esc(a.effectiveDate) + '</div>') : '') +
+        '</div>';
+      });
+    }
+    body += '</div>' +
+      '<div class="modal-actions"><button class="btn ghost" id="legalReviewNo">아니오</button><button class="btn primary" id="legalReviewYes">예 (반영)</button></div>';
+    showModal(body, true);
+    document.getElementById("legalReviewNo").addEventListener("click", closeModal);
+    document.getElementById("legalReviewYes").addEventListener("click", function(){
+      closeModal();
+      updates.forEach(function(u){
+        state.categories.forEach(function(cat){
+          var items = (state.selfCheckTemplate||{})[cat.id] || [];
+          items.forEach(function(it){
+            if (it.id === u.itemId) it.law = u.newLaw;
+          });
+        });
+      });
+      alerts.forEach(function(a){
+        var relatedCat = state.categories.filter(function(c){ return c.name === a.categoryName; })[0];
+        state.legalAlerts.push({
+          id: uid(), date: todayStr(), title: a.title, summary: a.summary || "",
+          sourceNote: a.sourceUrl ? ("참고: " + a.sourceUrl) : "", status: "반영완료",
+          relatedCategoryId: relatedCat ? relatedCat.id : ""
+        });
+      });
+      state.meta.lawReview = { reviewedDate: todayStr(), reviewedBy: "AI 자동 갱신" };
+      commit("법령 최신성 검토 반영 (근거법령 " + updates.length + "건, 신규 " + alerts.length + "건)");
+      toast("법령 갱신 내용이 반영되었습니다.");
     });
   }
 
