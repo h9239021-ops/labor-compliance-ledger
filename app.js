@@ -898,6 +898,8 @@
       if (editMode){
         var matHost = document.getElementById("roundMaterialFormHost");
         if (matHost){ matHost.innerHTML = roundMaterialForm(); bindRoundMaterialForm(matHost, curRound.id); }
+        bindEditRoundButton(el);
+        bindDeleteRound(el);
       }
       bindDeleteRoundMaterial(el);
       bindDeleteRoundAttachment(el);
@@ -1164,7 +1166,10 @@
   function renderRoundMetaAndMaterials(round){
     var html = '<div class="panel">' +
       '<div class="panel-head"><div><h2 style="font-size:16px;">' + esc(round.label) + '</h2>' +
-      '<div class="desc">' + (round.date ? fmtDate(round.date) : "일자 미상") + (round.agency ? ' · ' + esc(round.agency) : '') + (round.target ? ' · ' + esc(round.target) : '') + (round.type ? ' · ' + esc(round.type) + '감독' : '') + (round.department ? ' · 담당 ' + esc(round.department) : '') + '</div></div></div>';
+      '<div class="desc">' + (round.date ? fmtDate(round.date) : "일자 미상") + (round.agency ? ' · ' + esc(round.agency) : '') + (round.target ? ' · ' + esc(round.target) : '') + (round.type ? ' · ' + esc(round.type) + '감독' : '') + (round.department ? ' · 담당 ' + esc(round.department) : '') + '</div></div>' +
+      (editMode ? ('<div style="display:flex;gap:6px;flex-shrink:0;"><button class="btn sm" data-edit-round="' + round.id + '">수정</button><button class="btn sm danger" data-del-round="' + round.id + '">삭제</button></div>') : '') +
+    '</div>';
+    if (editMode) html += '<div id="roundEditFormHost" style="display:none;margin:0 0 12px;"></div>';
     if (round.notes) html += '<div class="item-desc" style="color:var(--ink-500);">' + esc(round.notes) + '</div>';
     if ((round.attachments||[]).length){
       html += '<div class="panel-head" style="margin-top:14px;"><div><h2 style="font-size:14px;">첨부목록</h2></div></div>';
@@ -1292,6 +1297,73 @@
           var round = roundById(roundId);
           if (round) round.attachments = (round.attachments||[]).filter(function(a){ return a.id !== attId; });
           commit("감독 시기 첨부목록 삭제");
+        });
+      });
+    });
+  }
+  function roundEditForm(round){
+    return '<form class="f" id="roundEditForm">' +
+      field("감독 시기 명칭 *", 'input', 'label', round.label, 'text', '예: 2026년 정기근로감독') +
+      field("감독 일자", 'input', 'date', round.date||todayStr(), 'date') +
+      selectField("감독구분", 'type', round.type||"정기", [["정기","정기"],["수시","수시"],["특별","특별"],["기타","기타"]]) +
+      field("감독기관", 'input', 'agency', round.agency||"", 'text', '예: 서울관악지청') +
+      field("대상 사업장", 'input', 'target', round.target||"", 'text') +
+      field("담당 부서", 'input', 'department', round.department||"", 'text', '예: 인사팀') +
+      fieldFull("비고", 'textarea', 'notes', round.notes||"") +
+      '<div class="form-actions"><button type="button" class="btn ghost sm" data-cancel-form="1">취소</button><button type="submit" class="btn primary sm">저장</button></div>' +
+    '</form>';
+  }
+  function bindEditRoundButton(root){
+    $all("[data-edit-round]", root).forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var id = btn.getAttribute("data-edit-round");
+        var round = roundById(id);
+        if (!round) return;
+        var host = document.getElementById("roundEditFormHost");
+        if (!host) return;
+        var show = host.style.display === "none";
+        host.style.display = show ? "block" : "none";
+        if (show){ host.innerHTML = roundEditForm(round); bindRoundEditForm(host, round.id); }
+        else { host.innerHTML = ""; }
+      });
+    });
+  }
+  function bindRoundEditForm(host, roundId){
+    var form = host.querySelector("#roundEditForm");
+    if (!form) return;
+    var cancel = form.querySelector("[data-cancel-form]");
+    if (cancel) cancel.addEventListener("click", function(){ host.style.display = "none"; host.innerHTML = ""; });
+    form.addEventListener("submit", function(e){
+      e.preventDefault();
+      var fd = new FormData(form);
+      if (!fd.get("label")){ alert("감독 시기 명칭은 필수입니다."); return; }
+      var round = roundById(roundId);
+      if (!round) return;
+      round.label = fd.get("label");
+      round.date = fd.get("date") || round.date || "";
+      round.type = fd.get("type");
+      round.agency = fd.get("agency") || "";
+      round.target = fd.get("target") || "";
+      round.department = fd.get("department") || "";
+      round.notes = fd.get("notes") || "";
+      commit("감독 시기 수정: " + round.label);
+    });
+  }
+  function bindDeleteRound(root){
+    $all("[data-del-round]", root).forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var id = btn.getAttribute("data-del-round");
+        var round = roundById(id);
+        if (!round) return;
+        var linkedCount = state.inspections.filter(function(i){ return i.roundId === id; }).length;
+        var msg = "이 감독 시기(" + round.label + ")를 삭제할까요? 되돌릴 수 없습니다." +
+          (linkedCount ? (" 연결된 적발 이력 " + linkedCount + "건은 삭제되지 않고 이 시기와의 연결만 해제됩니다.") : "");
+        confirmModal(msg, function(){
+          state.inspections.forEach(function(i){ if (i.roundId === id) i.roundId = ""; });
+          state.inspectionRounds = state.inspectionRounds.filter(function(r){ return r.id !== id; });
+          if (selectedRoundId === id) selectedRoundId = null;
+          saveUiState();
+          commit("감독 시기 삭제: " + round.label);
         });
       });
     });
