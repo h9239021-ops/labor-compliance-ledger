@@ -405,11 +405,25 @@
   }
 
   /* ---------- derived / computed ---------- */
+  function effectiveRepeatWindowYears(insp){
+    // 0 is a deliberate "재적발 제한 없음" setting (e.g. 개선권고), not "unset" —
+    // `insp.repeatWindowYears || default` would wrongly fall back to the default
+    // because 0 is falsy in JS, so this needs an explicit check.
+    var raw = insp.repeatWindowYears;
+    if (raw === 0 || raw === "0") return 0;
+    return raw || state.meta.defaultRepeatWindowYears;
+  }
+  function repeatDeadlineText(flags){
+    if (flags.noRepeatLimit) return "제한없음";
+    return flags.repeatDeadline ? fmtDate(flags.repeatDeadline) : "-";
+  }
   function computeInspectionFlags(insp){
-    var repeatDeadline = insp.foundDate ? addYears(insp.foundDate, insp.repeatWindowYears || state.meta.defaultRepeatWindowYears) : null;
+    var rwYears = effectiveRepeatWindowYears(insp);
+    var noRepeatLimit = rwYears === 0;
+    var repeatDeadline = (insp.foundDate && !noRepeatLimit) ? addYears(insp.foundDate, rwYears) : null;
     var withinWindow = repeatDeadline ? daysUntil(repeatDeadline) >= 0 : false;
     var overdue = insp.status !== "개선완료" && insp.correctionDeadline && daysUntil(insp.correctionDeadline) < 0;
-    return { repeatDeadline: repeatDeadline, withinWindow: withinWindow, overdue: overdue };
+    return { repeatDeadline: repeatDeadline, withinWindow: withinWindow, overdue: overdue, noRepeatLimit: noRepeatLimit };
   }
   function latestInspectionDate(){
     var dates = state.inspections.map(function(i){ return i.foundDate; }).filter(Boolean).sort();
@@ -430,10 +444,24 @@
     return map;
   }
   function riskWatchlist(){
+    // 가중처벌 위험구간: 시정명령/시정지시 중 "최초 적발일로부터 재적발 기준기간이
+    // 지나지 않은" 항목 전체. 개선 완료 여부는 무관하다 — 재적발 시 처벌이 가중되는
+    // 리스크는 개선을 마쳤는지와 별개로 그 위반이 재적발 제한기간 내인지로 결정되기
+    // 때문. 개선권고는 재적발 개념 자체가 적용되지 않으므로 제외하고, 재적발 기준기간을
+    // 0(제한없음)으로 설정한 항목도 제외한다.
     return state.inspections
+      .filter(function(i){ return i.severity !== "개선권고"; })
       .map(function(i){ return Object.assign({}, i, {flags: computeInspectionFlags(i)}); })
-      .filter(function(i){ return i.flags.withinWindow && i.status !== "개선완료"; })
-      .sort(function(a,b){ return daysUntil(a.flags.repeatDeadline) - daysUntil(b.flags.repeatDeadline); });
+      .filter(function(i){ return i.flags.repeatDeadline; });
+  }
+  function riskWatchlistGrouped(){
+    var all = riskWatchlist();
+    return {
+      active: all.filter(function(i){ return i.flags.withinWindow; })
+        .sort(function(a,b){ return daysUntil(a.flags.repeatDeadline) - daysUntil(b.flags.repeatDeadline); }),
+      expired: all.filter(function(i){ return !i.flags.withinWindow; })
+        .sort(function(a,b){ return daysUntil(b.flags.repeatDeadline) - daysUntil(a.flags.repeatDeadline); })
+    };
   }
   function overdueList(){
     return state.inspections
@@ -442,6 +470,10 @@
   }
   function openIssuesList(){
     return state.inspections.filter(function(i){ return i.status === "미착수" || i.status === "진행중"; });
+  }
+  function inspectionsBySeverityGroup(sevGroup, list){
+    list = list || state.inspections;
+    return list.filter(function(i){ return sevGroup === "advisory" ? i.severity === "개선권고" : i.severity !== "개선권고"; });
   }
 
   /* ---------- rendering: shell ---------- */
@@ -533,11 +565,11 @@
   function renderDashboard(){
     var el = document.getElementById("view-dashboard");
     var lastInsp = latestInspectionDate();
-    var openCount = openIssuesList().length;
-    var watch = riskWatchlist();
+    var openGrouped = openIssuesListGrouped();
+    var watchGrouped = riskWatchlistGrouped();
+    var watchActive = watchGrouped.active;
+    var watchExpired = watchGrouped.expired;
     var overdue = overdueList();
-    var watchStrict = watch.filter(function(i){ return i.severity !== "개선권고"; });
-    var watchAdvisory = watch.filter(function(i){ return i.severity === "개선권고"; });
     var overdueStrict = overdue.filter(function(i){ return i.severity !== "개선권고"; });
     var overdueAdvisory = overdue.filter(function(i){ return i.severity === "개선권고"; });
     var strictTotal = state.inspections.filter(function(i){return i.severity!=="개선권고";}).length;
@@ -554,26 +586,52 @@
     }
     html += '<div class="grid-stats">';
     html += statCard("최근 근로감독일", lastInsp ? fmtDate(lastInsp) : "이력 없음", "");
-    html += statCard("누적 적발 건수", String(strictTotal) + '<small>건</small>', "시정지시·시정명령 기준 · 개선권고 " + advisoryTotal + "건은 별도 관리(전체 " + state.inspections.length + "건)");
-    html += '<div class="stat" id="statOpenIssues" style="cursor:pointer;" title="클릭해서 목록 보기"><div class="label">미개선 건수</div><div class="value">' + openCount + '<small>건</small></div><div class="sub">진행중·미착수 합계 · 클릭해서 목록 보기 ↗</div></div>';
+    html += dualStatCard("누적 적발 건수", [
+      {key:"cumulative-strict", labelText:"시정지시/시정명령", count: strictTotal},
+      {key:"cumulative-advisory", labelText:"개선권고", count: advisoryTotal}
+    ]);
+    html += dualStatCard("미개선 건수", [
+      {key:"open-strict", labelText:"시정지시/시정명령", count: openGrouped.strict.length},
+      {key:"open-advisory", labelText:"개선권고", count: openGrouped.advisory.length}
+    ]);
     html += '<div class="stat" id="statNextCheck" style="cursor:pointer;" title="클릭해서 가장 최근 모의점검 내역 보기"><div class="label">다음 모의점검 권장일</div><div class="value">' + (nextCheckDue ? fmtDate(nextCheckDue) : "미실시") + '</div><div class="sub">' + esc(lr ? ("최근 " + lr.roundLabel + " · 위험 " + dangerCats + " / 주의 " + watchCats + " · 클릭해서 보기 ↗") : "아직 등록된 점검 없음") + '</div></div>';
     html += '</div>';
 
     html += '<div class="grid-stats">';
-    html += statCard("가중처벌 적용기간 내 미개선", String(watchStrict.length) + '<small>건</small>', "시정지시·시정명령 기준 · 적발일로부터 재적발 기준기간 이내 · 재적발 시 처벌 가중 위험", watchStrict.length>0);
+    html += statCard("가중처벌 적용기간 내", String(watchActive.length) + '<small>건</small>', "시정명령·시정지시 기준 · 재적발 기준기간이 아직 지나지 않은 항목(개선 완료 여부 무관) · 재적발 시 처벌 가중 위험", watchActive.length>0);
     html += statCard("개선기한 초과", String(overdueStrict.length) + '<small>건</small>', "시정지시·시정명령 기준 · 시정 완료가 지연되고 있는 항목", overdueStrict.length>0);
     html += '</div>';
 
-    var watchLi = function(i){
-      var dleft = daysUntil(i.flags.repeatDeadline);
-      return '<li class="clickable-row" data-goto-insp="' + i.id + '"><div class="wl-main"><span class="wl-cat">' + esc(catName(i.categoryId)) + '</span><span>' + esc(i.violationDesc || i.lawRef || "(내용 미입력)") + '</span></div>' +
-        '<span class="badge warn">D-' + dleft + ' · ' + fmtDate(i.flags.repeatDeadline) + ' 까지</span></li>';
+    var makeWatchLi = function(expired){
+      return function(i){
+        var statusBadge = i.status === "개선완료" ? '<span class="badge good">개선완료</span>' : '<span class="badge neutral">' + esc(i.status) + '</span>';
+        var periodBadge = expired
+          ? '<span class="badge neutral">' + fmtDate(i.flags.repeatDeadline) + ' 만료</span>'
+          : '<span class="badge warn">D-' + daysUntil(i.flags.repeatDeadline) + ' · ' + fmtDate(i.flags.repeatDeadline) + ' 까지</span>';
+        return '<li class="clickable-row" data-goto-insp="' + i.id + '"><div class="wl-main"><span class="wl-cat">' + esc(catName(i.categoryId)) + '</span><span>' + esc(i.violationDesc || i.lawRef || "(내용 미입력)") + '</span></div>' +
+          '<div style="display:flex;gap:6px;flex:none;">' + statusBadge + periodBadge + '</div></li>';
+      };
     };
-    html += '<div class="panel"><div class="panel-head"><div><h2>가중처벌 위험구간 워치리스트</h2><div class="desc">최초 적발일로부터 재적발 기준기간(기본 3년)이 아직 지나지 않았고, 아직 개선이 완료되지 않은 항목입니다. 이 기간 중 동일 위반이 재적발되면 과태료·처벌이 가중될 수 있습니다. (시정지시와 개선권고는 재적발 위험수준이 달라 구분 표기합니다.)</div></div></div>';
-    if (!watch.length){
+    var watchActiveLi = makeWatchLi(false);
+    var watchExpiredLi = makeWatchLi(true);
+    var bySev = function(sev){ return function(i){ return i.severity === sev; }; };
+
+    html += '<div class="panel"><div class="panel-head"><div><h2>가중처벌 위험구간 워치리스트</h2><div class="desc">최초 적발일로부터 재적발 기준기간이 아직 지나지 않은 시정명령·시정지시 항목입니다(개선 완료 여부와 무관하게 모두 표기, 개선권고와 재적발 기준기간을 0(제한없음)으로 둔 항목은 제외). 이 기간 중 동일 위반이 재적발되면 과태료·처벌이 가중될 수 있습니다.</div></div></div>';
+    if (!watchActive.length && !watchExpired.length){
       html += '<div class="empty-row">해당 항목이 없습니다.</div>';
     } else {
-      html += severityGroupBlock("시정지시/시정명령", watchStrict, watchLi) + severityGroupBlock("개선권고", watchAdvisory, watchLi);
+      if (!watchActive.length){
+        html += '<div class="empty-row">재적발 기준기간이 남아있는 항목이 없습니다.</div>';
+      } else {
+        html += severityGroupBlock("시정명령", watchActive.filter(bySev("시정명령")), watchActiveLi) +
+          severityGroupBlock("시정지시", watchActive.filter(bySev("시정지시")), watchActiveLi);
+      }
+      if (watchExpired.length){
+        html += '<details class="cat" style="margin-top:10px;"><summary><span class="cat-title"><span class="cat-chevron">▸</span>재적발 기준기간이 지난 항목<span class="badge neutral">' + watchExpired.length + '건</span></span></summary><div class="cat-body">' +
+          severityGroupBlock("시정명령", watchExpired.filter(bySev("시정명령")), watchExpiredLi) +
+          severityGroupBlock("시정지시", watchExpired.filter(bySev("시정지시")), watchExpiredLi) +
+        '</div></details>';
+      }
     }
     html += '</div>';
 
@@ -588,8 +646,16 @@
     }
 
     el.innerHTML = html;
-    var openBtn = document.getElementById("statOpenIssues");
-    if (openBtn) openBtn.addEventListener("click", openOpenIssuesModal);
+    var dualActions = {
+      "cumulative-strict": function(){ openFindingsListModal("누적 적발 건수 · 시정지시/시정명령", "", inspectionsBySeverityGroup("strict")); },
+      "cumulative-advisory": function(){ openFindingsListModal("누적 적발 건수 · 개선권고", "", inspectionsBySeverityGroup("advisory")); },
+      "open-strict": function(){ openFindingsListModal("미개선 건수 · 시정지시/시정명령", "진행중·미착수 항목", openGrouped.strict); },
+      "open-advisory": function(){ openFindingsListModal("미개선 건수 · 개선권고", "진행중·미착수 항목", openGrouped.advisory); }
+    };
+    $all("[data-dual-key]", el).forEach(function(row){
+      var key = row.getAttribute("data-dual-key");
+      row.addEventListener("click", function(){ if (dualActions[key]) dualActions[key](); });
+    });
     var nextCheckBtn = document.getElementById("statNextCheck");
     if (nextCheckBtn) nextCheckBtn.addEventListener("click", openLatestSelfCheckModal);
     $all("[data-goto-insp]", el).forEach(function(li){
@@ -598,6 +664,12 @@
   }
   function statCard(label, value, sub, flag){
     return '<div class="stat' + (flag?" flag":"") + '"><div class="label">' + esc(label) + '</div><div class="value">' + value + '</div><div class="sub">' + esc(sub||"") + '</div></div>';
+  }
+  function dualStatCard(label, rows){
+    var rowsHtml = rows.map(function(r){
+      return '<div class="stat-dual-row clickable-row" data-dual-key="' + esc(r.key) + '" title="클릭해서 목록 보기"><span class="stat-dual-label">' + esc(r.labelText) + '</span><span class="stat-dual-num">' + r.count + '<small> 건</small></span></div>';
+    }).join("");
+    return '<div class="stat"><div class="label">' + esc(label) + '</div><div class="stat-dual">' + rowsHtml + '</div></div>';
   }
   function severityGroupBlock(title, items, renderItem){
     if (!items.length) return "";
@@ -613,26 +685,22 @@
       advisory: list.filter(function(i){ return i.severity === "개선권고"; })
     };
   }
-  function openOpenIssuesModal(){
-    var grouped = openIssuesListGrouped();
-    var total = grouped.strict.length + grouped.advisory.length;
-    var body = '<h3>미개선 적발사항 (' + total + '건)</h3>' +
-      '<p class="hint" style="margin-top:2px;">시정지시/시정명령(실제 적발)과 개선권고(권고사항)는 재적발 시 위험수준이 달라 구분해 표기합니다.</p>';
-    if (!total){
-      body += '<p class="hint">미개선 항목이 없습니다.</p>';
+  function openFindingsListModal(title, hintText, list){
+    var body = '<h3>' + esc(title) + ' (' + list.length + '건)</h3>' +
+      (hintText ? '<p class="hint" style="margin-top:2px;">' + esc(hintText) + '</p>' : '');
+    if (!list.length){
+      body += '<p class="hint">해당 항목이 없습니다.</p>';
     } else {
       var renderIssueLi = function(i){
         return '<li class="clickable-row" data-goto-insp="' + i.id + '"><div class="wl-main"><span class="wl-cat">' + esc(catName(i.categoryId)) + ' · ' + esc(i.status) + '</span><span>' + esc(i.violationDesc || i.lawRef || "-") + '</span></div>' +
           '<span class="mono" style="font-size:11.5px;color:var(--ink-500);flex:none;">' + fmtDate(i.foundDate) + '</span></li>';
       };
-      body += '<div style="max-height:420px;overflow-y:auto;">' +
-        severityGroupBlock("시정지시/시정명령", grouped.strict, renderIssueLi) +
-        severityGroupBlock("개선권고", grouped.advisory, renderIssueLi) +
-      '</div>';
+      var sorted = list.slice().sort(function(a,b){ return (b.foundDate||"").localeCompare(a.foundDate||""); });
+      body += '<div style="max-height:420px;overflow-y:auto;"><ul class="watchlist">' + sorted.map(renderIssueLi).join("") + '</ul></div>';
     }
-    body += '<div class="modal-actions"><button class="btn ghost" id="closeIssuesModal">닫기</button></div>';
+    body += '<div class="modal-actions"><button class="btn ghost" id="closeFindingsListModal">닫기</button></div>';
     showModal(body, true);
-    document.getElementById("closeIssuesModal").addEventListener("click", closeModal);
+    document.getElementById("closeFindingsListModal").addEventListener("click", closeModal);
     $all("[data-goto-insp]", document.getElementById("modalRoot")).forEach(function(li){
       li.addEventListener("click", function(){ goToInspection(li.getAttribute("data-goto-insp")); });
     });
@@ -736,7 +804,7 @@
           '<td class="mono">' + (i.correctionCompletedDate ? fmtDate(i.correctionCompletedDate) : "-") + '</td>' +
           '<td class="mono">' + (i.reportDate ? fmtDate(i.reportDate) : "-") + '</td>' +
           '<td>' + (i.fineImposed === "부과" ? '<span class="badge warn">부과</span>' : '<span class="badge neutral">미부과</span>') + '</td>' +
-          '<td class="mono">' + (flags.repeatDeadline ? fmtDate(flags.repeatDeadline) : "-") + '</td>' +
+          '<td class="mono">' + repeatDeadlineText(flags) + '</td>' +
           (editMode ? ('<td style="white-space:nowrap;"><button class="btn sm" data-edit-finding="' + i.id + '">수정</button> <button class="btn sm danger" data-del-insp="' + i.id + '">삭제</button></td>') : '') +
         '</tr>';
       });
@@ -1233,7 +1301,7 @@
     var flags = computeInspectionFlags(i);
     var sevBadge = severityBadge(i.severity);
     var statusBadge = i.status === "개선완료" ? '<span class="badge good">개선완료</span>' : (flags.overdue ? '<span class="badge danger">기한초과</span>' : '<span class="badge neutral">' + esc(i.status) + '</span>');
-    var repeatBadge = (i.status !== "개선완료" && flags.withinWindow) ? '<span class="badge warn">재적발 위험 · D-' + daysUntil(flags.repeatDeadline) + '</span>' : '';
+    var repeatBadge = flags.withinWindow ? '<span class="badge warn">재적발 위험 · D-' + daysUntil(flags.repeatDeadline) + '</span>' : '';
     var editBtns = editMode ? '<div class="item-actions"><button class="btn sm" data-edit-insp="' + i.id + '">수정</button><button class="btn sm danger" data-del-insp="' + i.id + '">삭제</button></div>' : '';
     var links = (i.links||[]).map(function(l){ return '<a class="link-chip" href="' + esc(l.url) + '" target="_blank" rel="noopener">🔗 ' + esc(l.label || "관련자료") + '</a>'; }).join("");
     if (i.correctionEvidenceUrl) links += '<a class="link-chip" href="' + esc(i.correctionEvidenceUrl) + '" target="_blank" rel="noopener">✅ 개선완료 증빙자료(링크)</a>';
@@ -1248,8 +1316,8 @@
         metaField("감독 시기", roundLabel(i)) +
         metaField("처분결과", (i.disposition||"-") + (i.dispositionAmount ? " (" + Number(i.dispositionAmount).toLocaleString() + "만원)" : "")) +
         metaField("과태료 부과여부", i.fineImposed || "미부과") +
-        metaField("재적발 기준기간", (i.repeatWindowYears || state.meta.defaultRepeatWindowYears) + "년") +
-        metaField("재적발 제한일", flags.repeatDeadline ? fmtDate(flags.repeatDeadline) : "-") +
+        metaField("재적발 기준기간", flags.noRepeatLimit ? "제한없음" : (effectiveRepeatWindowYears(i) + "년")) +
+        metaField("재적발 제한일", repeatDeadlineText(flags)) +
         metaField("개선기한", i.correctionDeadline ? fmtDate(i.correctionDeadline) : "-") +
         metaField("개선일자", i.correctionCompletedDate ? fmtDate(i.correctionCompletedDate) : "-") +
         metaField("보고일자", i.reportDate ? fmtDate(i.reportDate) : "-") +
@@ -1277,7 +1345,8 @@
     if (!insp.id) insp.id = uid();
     var linksVal = (insp.links||[]).map(function(l){ return l.label + "|" + l.url; }).join("\n");
     var catOpts = state.categories.map(function(c){ return '<option value="' + c.id + '"' + (c.id === (insp.categoryId||catId) ? " selected" : "") + '>' + esc(c.name) + '</option>'; }).join("");
-    var previewDeadline = insp.foundDate ? addYears(insp.foundDate, insp.repeatWindowYears || state.meta.defaultRepeatWindowYears) : null;
+    var previewRwYears = effectiveRepeatWindowYears(insp);
+    var previewDeadline = (insp.foundDate && previewRwYears > 0) ? addYears(insp.foundDate, previewRwYears) : null;
     var curRoundId = insp.roundId || presetRoundId || "";
     var roundOpts = '<option value="">(연결 안 함)</option>' + (state.inspectionRounds||[]).slice().sort(function(a,b){ return (b.date||"").localeCompare(a.date||""); }).map(function(r){
       return '<option value="' + r.id + '"' + (r.id === curRoundId ? " selected" : "") + '>' + esc(r.label) + '</option>';
@@ -1299,7 +1368,8 @@
         field("개선기한", 'input', 'correctionDeadline', insp.correctionDeadline, 'date') +
         field("개선 일자", 'input', 'correctionCompletedDate', insp.correctionCompletedDate, 'date') +
         field("보고 일자", 'input', 'reportDate', insp.reportDate, 'date') +
-        '<div class="full" style="font-size:12px;color:var(--ink-500);margin-top:-4px;">재적발 제한일 (자동계산): <span class="mono repeat-preview">' + (previewDeadline ? fmtDate(previewDeadline) : "-") + '</span></div>' +
+        '<div class="full" style="font-size:11.5px;color:var(--ink-500);margin-top:-8px;">0으로 두면 재적발 제한 없음으로 처리됩니다 (예: 개선권고).</div>' +
+        '<div class="full" style="font-size:12px;color:var(--ink-500);margin-top:-4px;">재적발 제한일 (자동계산): <span class="mono repeat-preview">' + (previewRwYears === 0 ? "제한없음" : (previewDeadline ? fmtDate(previewDeadline) : "-")) + '</span></div>' +
         fieldFull("위반/부족 내용", 'textarea', 'violationDesc', insp.violationDesc) +
         fieldFull("개선방안", 'textarea', 'correctionPlan', insp.correctionPlan) +
         fieldFull("개선결과", 'textarea', 'correctionResult', insp.correctionResult) +
@@ -1340,7 +1410,10 @@
     var yearsInput = form.querySelector('[name="repeatWindowYears"]');
     var preview = form.querySelector('.repeat-preview');
     function updatePreview(){
-      var fd = foundDateInput.value, yrs = Number(yearsInput.value) || state.meta.defaultRepeatWindowYears;
+      var fd = foundDateInput.value;
+      var yrsRaw = yearsInput.value;
+      var yrs = yrsRaw === "" ? state.meta.defaultRepeatWindowYears : Number(yrsRaw);
+      if (yrs === 0){ preview.textContent = "제한없음"; return; }
       preview.textContent = fd ? fmtDate(addYears(fd, yrs)) : "-";
     }
     if (foundDateInput) foundDateInput.addEventListener("input", updatePreview);
