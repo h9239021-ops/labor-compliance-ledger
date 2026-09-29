@@ -1,3 +1,4 @@
+
 /* ===================== 근로감독 리스크 관리대장 ===================== */
 (function(){
   "use strict";
@@ -33,10 +34,10 @@
     });
   }
 
-  async function openStorageFile(path){
+  async function openStorageFile(path, downloadName){
     if (!sb) return;
     try {
-      var res = await sb.storage.from(STORAGE_BUCKET).createSignedUrl(path, 300);
+      var res = await sb.storage.from(STORAGE_BUCKET).createSignedUrl(path, 300, downloadName ? { download: downloadName } : undefined);
       if (res.error || !res.data) { alert("파일을 여는 중 문제가 발생했습니다: " + (res.error ? res.error.message : "")); return; }
       window.open(res.data.signedUrl, "_blank", "noopener");
     } catch(e){
@@ -47,7 +48,7 @@
     var a = e.target.closest ? e.target.closest("[data-storage-path]") : null;
     if (!a) return;
     e.preventDefault();
-    openStorageFile(a.getAttribute("data-storage-path"));
+    openStorageFile(a.getAttribute("data-storage-path"), a.getAttribute("data-storage-name") || undefined);
   });
 
   /* ---------- utils ---------- */
@@ -131,7 +132,14 @@
   async function uploadOneFile(file, pathPrefix){
     if (!sb) return {ok:false, message:"저장소 연결이 초기화되지 않았습니다. 새로고침 후 다시 시도해주세요."};
     var fid = uid();
-    var path = pathPrefix + "/" + fid + "-" + sanitizeFileName(file.name);
+    // Supabase Storage object keys must be ASCII-only — Korean text, accented letters,
+    // emoji, spaces, etc. in the key make the upload fail with "Invalid key". So the
+    // storage key uses only the random id + extension; the original (Korean-friendly)
+    // filename is kept separately in the attachment's metadata for display, and handed
+    // back to Storage only as the suggested download name via createSignedUrl's
+    // `download` option — never as part of the actual key.
+    var ext = extOf(file.name).replace(/[^a-zA-Z0-9]/g, "");
+    var path = pathPrefix + "/" + fid + (ext ? ("." + ext) : "");
     try {
       var res = await sb.storage.from(STORAGE_BUCKET).upload(path, file, { contentType: file.type || undefined, upsert: false });
       if (res.error) throw res.error;
@@ -144,7 +152,7 @@
     if (!files || !files.length) return '<div class="empty-row" style="padding:2px 0;">첨부된 파일이 없습니다.</div>';
     return '<ul class="attach-list">' + files.map(function(f){
       var isStored = !!f.path;
-      var linkAttr = isStored ? ('data-storage-path="' + esc(f.path) + '"') : '';
+      var linkAttr = isStored ? ('data-storage-path="' + esc(f.path) + '" data-storage-name="' + esc(f.name) + '"') : '';
       var href = isStored ? '#' : esc(f.url||"#");
       return '<li class="attach-item"><a href="' + href + '" ' + linkAttr + (isStored ? '' : ' target="_blank" rel="noopener"') + '>📎 ' + esc(f.name) + '</a>' +
         (f.size ? ('<span class="mono" style="font-size:11px;color:var(--ink-500);">' + humanSize(f.size) + '</span>') : '') +
@@ -1049,7 +1057,7 @@
       html += '<tr><td colspan="6" class="empty-row">등록된 자료가 없습니다.</td></tr>';
     } else {
       mats.slice().sort(function(a,b){ return (b.uploadedDate||"").localeCompare(a.uploadedDate||""); }).forEach(function(m){
-        var openLink = m.file ? ('<a href="#" data-storage-path="' + esc(m.file.path) + '">📎 ' + esc(m.file.name) + '</a>') :
+        var openLink = m.file ? ('<a href="#" data-storage-path="' + esc(m.file.path) + '" data-storage-name="' + esc(m.file.name) + '">📎 ' + esc(m.file.name) + '</a>') :
           (m.url ? ('<a href="' + esc(m.url) + '" target="_blank" rel="noopener">열기 ↗</a>') : '-');
         html += '<tr><td>' + esc(m.kind) + '</td><td>' + esc(m.name) + '</td>' +
           '<td>' + openLink + '</td>' +
@@ -1155,7 +1163,7 @@
     var editBtns = editMode ? '<div class="item-actions"><button class="btn sm" data-edit-insp="' + i.id + '">수정</button><button class="btn sm danger" data-del-insp="' + i.id + '">삭제</button></div>' : '';
     var links = (i.links||[]).map(function(l){ return '<a class="link-chip" href="' + esc(l.url) + '" target="_blank" rel="noopener">🔗 ' + esc(l.label || "관련자료") + '</a>'; }).join("");
     if (i.correctionEvidenceUrl) links += '<a class="link-chip" href="' + esc(i.correctionEvidenceUrl) + '" target="_blank" rel="noopener">✅ 개선완료 증빙자료(링크)</a>';
-    var evidenceFiles = (i.correctionEvidenceFiles||[]).map(function(f){ return '<a class="link-chip" href="#" data-storage-path="' + esc(f.path) + '">✅ ' + esc(f.name) + '</a>'; }).join("");
+    var evidenceFiles = (i.correctionEvidenceFiles||[]).map(function(f){ return '<a class="link-chip" href="#" data-storage-path="' + esc(f.path) + '" data-storage-name="' + esc(f.name) + '">✅ ' + esc(f.name) + '</a>'; }).join("");
     return '<div class="item-card" id="insp-' + i.id + '">' +
       '<div class="item-top"><div class="item-badges">' + sevBadge + statusBadge + repeatBadge + '</div>' +
         '<span class="mono" style="font-size:12px;color:var(--ink-500);">감독일시 ' + fmtDate(i.foundDate) + '</span></div>' +
