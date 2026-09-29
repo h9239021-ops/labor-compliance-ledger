@@ -1071,7 +1071,7 @@
           fineImposed: it.fineImposed === "부과" ? "부과" : "미부과",
           repeatWindowYears: state.meta.defaultRepeatWindowYears,
           correctionDeadline: it.correctionDeadline || "", correctionCompletedDate: "", reportDate: "",
-          violationDesc: it.violationDesc || "", correctionPlan: it.correctionPlan || "", correctionResult: "", notes: "AI 자동 인식(첨부파일 기반) — 내용을 검토해주세요."
+          violationDesc: it.violationDesc || "", correctionPlan: it.correctionPlan || "", correctionResult: "", notes: ""
         };
         state.inspections.push(obj);
       });
