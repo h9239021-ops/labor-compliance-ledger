@@ -18,6 +18,8 @@
   var draftAnswers = {};
 
   /* ---------- 근로감독 안내 tab: static reference data (근로감독관집무규정 등) ---------- */
+  var guideCatOpen = {};    // { checklist: bool, sanctions: bool } — accordion open state, UI-only (not synced)
+  var guideSubcatOpen = {}; // { "chk-<no>": bool, "sanc-<law>": bool } — accordion open state, UI-only (not synced)
   var GUIDE_TYPES = [
     { name: "정기감독", tagClass: "", tag: "계획형 · 사전통보",
       desc: "고용노동부·지방관서의 사업장근로감독 종합(세부)시행계획에 따라 실시. 통상 사전에 서면으로 통보." },
@@ -436,6 +438,52 @@
       ["제16조제1항·제3항","유급휴일 및 연차유급휴가 미부여","시정기간 25일 이내(미시정시 범죄인지)"]
     ]}
   ];
+
+  /* ---------- 위반횟수별 과태료 금액표 (각 법률 시행령 별표) ---------- */
+  // 근로기준법: 근로기준법 시행령 [별표7] <개정 2021.11.19.> 과태료의 부과기준(제60조 관련) 원문 전사.
+  // 다른 법률은 각 법률 자체의 시행령 별표(근로감독관집무규정 별표3과는 별개 문서)에 규정되어 있어
+  // 원문 확보 전까지 비워둠 — 리니에게 별도 확인 요청.
+  var GUIDE_FINES = {
+    "근로기준법": [
+      ["제13조", "보고·출석 요구에 불응 (보고 또는 출석을 하지 않은 경우)", "50만원", "100만원", "200만원"],
+      ["제13조", "거짓된 보고를 한 경우", "300만원", "300만원", "300만원"],
+      ["제14조", "법령요지 게시 또는 비치의무 위반", "30만원", "50만원", "100만원"],
+      ["제39조", "사용증명서를 즉시 내어주지 않은 경우", "30만원", "50만원", "100만원"],
+      ["제39조", "사실과 다르게 적은 사용증명서를 내어준 경우", "50만원", "100만원", "200만원"],
+      ["제39조", "근로자가 요구하지 않은 사항을 사용증명서에 적은 경우", "80만원", "150만원", "300만원"],
+      ["제41조", "근로자 명부를 작성하지 않은 경우", "30만원", "50만원", "100만원"],
+      ["제41조", "근로자 명부 기재사항 일부 미기재 또는 변경내용 미정정", "20만원", "30만원", "50만원"],
+      ["제42조", "근로자명부·근로계약 관련 중요서류 보존의무 위반", "80만원", "150만원", "300만원"],
+      ["제48조제1항", "임금대장을 작성하지 않은 경우", "30만원", "50만원", "100만원"],
+      ["제48조제1항", "임금대장에 기재해야 할 사항을 일부 적지 않은 경우", "20만원", "30만원", "50만원"],
+      ["제48조제2항", "임금명세서를 교부하지 않은 경우", "30만원", "50만원", "100만원"],
+      ["제48조제2항", "임금명세서 기재사항 미기재 또는 사실과 다르게 기재", "20만원", "30만원", "50만원"],
+      ["제51조의2제5항", "임금보전방안을 신고하지 않은 경우", "80만원", "150만원", "300만원"],
+      ["제66조", "연소자 증명서류 비치의무 위반", "80만원", "150만원", "300만원"],
+      ["제74조제7항", "임신기 근로시간 단축을 허용하지 않은 경우", "500만원", "500만원", "500만원"],
+      ["제74조제9항", "임신 중인 여성근로자의 출퇴근시간 변경을 허용하지 않은 경우", "500만원", "500만원", "500만원"],
+      ["제76조의2", "사용자가 한 사람에게 수차례 또는 2명 이상에게 직장 내 괴롭힘을 한 경우", "500만원", "1,000만원", "1,000만원"],
+      ["제76조의2", "사용자의 그 밖의 직장 내 괴롭힘", "300만원", "1,000만원", "1,000만원"],
+      ["제76조의2", "사용자의 친족인 근로자가 직장 내 괴롭힘을 한 경우", "200만원", "500만원", "1,000만원"],
+      ["제76조의3제2항", "직장 내 괴롭힘 발생사실 확인 조사를 실시하지 않은 경우", "300만원", "500만원", "500만원"],
+      ["제76조의3제4항", "근무장소의 변경 등 적절한 조치를 하지 않은 경우", "200만원", "300만원", "500만원"],
+      ["제76조의3제5항", "징계 등 필요한 조치를 하지 않은 경우", "200만원", "300만원", "500만원"],
+      ["제76조의3제7항", "조사 과정에서 알게 된 비밀을 누설한 경우", "300만원", "500만원", "500만원"],
+      ["제91조", "재해보상에 관한 중요서류를 폐기한 경우", "50만원", "100만원", "200만원"],
+      ["제93조", "취업규칙을 작성하지 않은 경우", "70만원", "130만원", "250만원"],
+      ["제93조", "취업규칙을 작성하고 신고하지 않은 경우", "40만원", "80만원", "150만원"],
+      ["제93조", "취업규칙의 변경신고를 하지 않은 경우", "40만원", "80만원", "150만원"],
+      ["제98조제2항", "기숙사 임원 선거에 간섭한 경우", "80만원", "150만원", "300만원"],
+      ["제99조", "기숙사규칙을 작성하지 않은 경우", "40만원", "80만원", "150만원"],
+      ["제99조", "기숙사규칙 작성·변경시 근로자 과반수 대표의 동의를 받지 않은 경우", "20만원", "30만원", "50만원"],
+      ["제99조", "기숙사규칙을 지키지 않은 경우", "30만원", "50만원", "100만원"],
+      ["제102조", "근로감독관(또는 위촉 의사)의 현장조사·검진을 거절·방해·기피한 경우", "500만원", "500만원", "500만원"],
+      ["제102조", "근로감독관의 심문에 대해 진술을 하지 않은 경우", "50만원", "100만원", "200만원"],
+      ["제102조", "근로감독관의 심문에 대해 거짓 진술을 한 경우", "300만원", "300만원", "300만원"],
+      ["제102조", "근로감독관의 요구에 장부·서류를 제출하지 않은 경우", "50만원", "100만원", "200만원"],
+      ["제102조", "근로감독관의 요구에 거짓 장부·서류를 제출한 경우", "300만원", "300만원", "300만원"]
+    ]
+  };
 
   /* ---------- supabase (storage + real multi-user auth) ---------- */
   var STORAGE_BUCKET = "labor-compliance-files";
@@ -2426,11 +2474,12 @@
       '</div></div>';
 
     html += '<div class="panel"><div class="panel-head"><h2>사업장 감독 시 주요 확인 서류 체크리스트</h2><div class="desc">근로감독관집무규정 별표2 · 13개 법령분야' + (editMode ? '' : ' · 편집모드에서 항목을 체크할 수 있습니다') + '</div></div>' +
-      '<details class="cat">' +
+      '<details class="cat"' + (guideCatOpen.checklist ? ' open' : '') + ' data-guide-cat="checklist">' +
         '<summary><span class="cat-title"><span class="cat-chevron">▸</span>사업장감독 시 점검 확인 주요 서류 (별표2)<span class="badge">13개 분야</span></span></summary>' +
         '<div class="cat-body">' +
         GUIDE_CHECKLIST.map(function(cat){
-          return '<details class="subcat">' +
+          var subId = "chk-" + cat.no;
+          return '<details class="subcat"' + (guideSubcatOpen[subId] ? ' open' : '') + ' data-guide-subcat="' + subId + '">' +
             '<summary><span class="subcat-chevron">▸</span>' + cat.no + '. ' + esc(cat.title) + '</summary>' +
             '<div class="subcat-body"><div class="checklist-grid">' +
               cat.items.map(function(item, idx){
@@ -2446,20 +2495,32 @@
     '</div>';
 
     html += '<div class="panel"><div class="panel-head"><h2>개별근로관계법 위반사항 조치기준</h2><div class="desc">근로감독관집무규정 별표3 · ' + GUIDE_SANCTIONS.length + '개 법률</div></div>' +
-      '<details class="cat">' +
+      '<details class="cat"' + (guideCatOpen.sanctions ? ' open' : '') + ' data-guide-cat="sanctions">' +
         '<summary><span class="cat-title"><span class="cat-chevron">▸</span>개별근로관계법 위반사항 조치기준 (별표3)<span class="badge">' + GUIDE_SANCTIONS.length + '개 법률</span></span></summary>' +
         '<div class="cat-body">' +
         '<div class="sanction-note"><b>일반조치기준</b><ul>' +
           GUIDE_SANCTION_GENERAL.map(function(g){ return '<li>' + esc(g) + '</li>'; }).join("") +
         '</ul></div>' +
         GUIDE_SANCTIONS.map(function(law){
-          return '<details class="subcat">' +
+          var subId = "sanc-" + law.law;
+          var fineRows = (GUIDE_FINES[law.law] || []);
+          var fineTable = fineRows.length ? (
+            '<div class="fine-subhead">과태료 부과기준 (위반횟수별 금액)</div>' +
+            '<table class="tbl"><thead><tr><th>법조문</th><th>위반행위</th><th>1차</th><th>2차</th><th>3차 이상</th></tr></thead><tbody>' +
+              fineRows.map(function(f){
+                return '<tr><td class="mono">' + esc(f[0]) + '</td><td>' + esc(f[1]) + '</td><td class="mono">' + esc(f[2]) + '</td><td class="mono">' + esc(f[3]) + '</td><td class="mono">' + esc(f[4]) + '</td></tr>';
+              }).join("") +
+            '</tbody></table>'
+          ) : '';
+          return '<details class="subcat"' + (guideSubcatOpen[subId] ? ' open' : '') + ' data-guide-subcat="' + esc(subId) + '">' +
             '<summary><span class="subcat-chevron">▸</span>' + esc(law.law) + '<span class="badge neutral">' + law.rows.length + '개 조문</span></summary>' +
             '<div class="subcat-body scrollx"><table class="tbl"><thead><tr><th>법조문</th><th>위반사례</th><th>조치기준</th></tr></thead><tbody>' +
               law.rows.map(function(r){
                 return '<tr><td class="mono">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td><td>' + esc(r[2]) + '</td></tr>';
               }).join("") +
-            '</tbody></table></div>' +
+            '</tbody></table>' +
+            fineTable +
+            '</div>' +
           '</details>';
         }).join("") +
         '</div>' +
@@ -2477,6 +2538,16 @@
         if (!state.guideChecklistChecked) state.guideChecklistChecked = {};
         state.guideChecklistChecked[id] = cb.checked;
         commit("체크리스트 항목 " + (cb.checked ? "체크" : "체크 해제") + " (" + id + ")");
+      });
+    });
+    $all("details[data-guide-cat]", el).forEach(function(d){
+      d.addEventListener("toggle", function(){
+        guideCatOpen[d.getAttribute("data-guide-cat")] = d.open;
+      });
+    });
+    $all("details[data-guide-subcat]", el).forEach(function(d){
+      d.addEventListener("toggle", function(){
+        guideSubcatOpen[d.getAttribute("data-guide-subcat")] = d.open;
       });
     });
   }
