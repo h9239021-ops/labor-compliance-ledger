@@ -2563,6 +2563,15 @@
       '<div class="row"><span>실제 저장 권한</span><span>Supabase에 등록된 <b>편집자 계정</b>으로 로그인한 사람만 저장 가능 (관리자에게 계정 등록 요청)</span></div>' +
       '</div></div>';
 
+    html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">비밀번호 변경</h2>' +
+      '<form class="f" id="pwChangeForm">' +
+        '<input type="password" name="pw1" placeholder="새 비밀번호 (6자 이상)" required minlength="6" autocomplete="new-password">' +
+        '<input type="password" name="pw2" placeholder="새 비밀번호 확인" required minlength="6" autocomplete="new-password">' +
+        '<div class="form-actions"><button type="submit" class="btn sm" id="pwChangeBtn">비밀번호 변경</button></div>' +
+      '</form>' +
+      '<p class="hint" style="margin-top:8px;font-size:12px;">현재 로그인된 계정(' + esc((currentUser && currentUser.email) || "") + ')의 비밀번호만 바뀝니다. 다른 사람의 비밀번호는 여기서 바꿀 수 없습니다.</p>' +
+    '</div>';
+
     html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">기본 설정</h2>';
     if (editMode){
       html += '<form class="f" id="settingsForm">' +
@@ -2587,6 +2596,24 @@
       }).join("") + '</ul></div>';
 
     el.innerHTML = html;
+    var pwForm = document.getElementById("pwChangeForm");
+    if (pwForm){
+      pwForm.addEventListener("submit", async function(e){
+        e.preventDefault();
+        var fd = new FormData(pwForm);
+        var p1 = fd.get("pw1") || "";
+        var p2 = fd.get("pw2") || "";
+        if (p1.length < 6){ alert("비밀번호는 6자 이상이어야 합니다."); return; }
+        if (p1 !== p2){ alert("새 비밀번호 확인이 일치하지 않습니다."); return; }
+        var btn = document.getElementById("pwChangeBtn");
+        btn.disabled = true;
+        var res = await sb.auth.updateUser({ password: p1 });
+        btn.disabled = false;
+        if (res.error){ alert("비밀번호 변경에 실패했습니다: " + res.error.message); return; }
+        pwForm.reset();
+        toast("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.");
+      });
+    }
     if (editMode){
       var sf = document.getElementById("settingsForm");
       sf.addEventListener("submit", function(e){
