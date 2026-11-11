@@ -3,14 +3,14 @@
 (function(){
   "use strict";
 
-  var TITLE = "근로감독 리스크 관리대장";
+  var TITLE = "근로감독 대시보드";
   var DRAFT_KEY = "hrSelfCheckDraft_v1";
   var UI_STATE_KEY = "hrUiState_v1";
 
   var state = null;
   var editMode = false;
   var editorName = "";
-  var activeTab = "dashboard";
+  var activeTab = "home";
   var findingsFilter = { severity: "all", status: "all" };
   var inspectionViewMode = "byCategory"; // "byCategory" | "byRound"
   var selectedRoundId = null;
@@ -486,7 +486,7 @@
   };
 
   /* ---------- supabase (storage + real multi-user auth) ---------- */
-  var STORAGE_BUCKET = "labor-compliance-files";
+  var STORAGE_BUCKET = (window.SUPABASE_CONFIG && window.SUPABASE_CONFIG.bucket) || "dashboard-files";
   var sb = (typeof window !== "undefined" && window.SUPABASE_CONFIG)
     ? window.supabase.createClient(window.SUPABASE_CONFIG.url, window.SUPABASE_CONFIG.anonKey)
     : null;
@@ -750,15 +750,63 @@
   }
 
   /* ---------- load state / draft ---------- */
-  var APP_STATE_ROW_ID = "main";
+  // Ledger data lives in one app_state row per section so that Row Level Security can
+  // enforce per-menu write permission on the server:
+  //   findings  -> inspections            (ledger_findings)
+  //   rounds    -> inspectionRounds, materials   (ledger_rounds)
+  //   selfcheck -> selfCheckRounds, selfCheckTemplate, legalAlerts, legalWatchlist, lawReview (ledger_selfcheck)
+  //   settings  -> meta, categories, guideChecklistChecked  (admin)
+  var SECTION_KEYS = {
+    findings: ["inspections"],
+    rounds: ["inspectionRounds", "materials"],
+    selfcheck: ["selfCheckRounds", "selfCheckTemplate", "legalAlerts", "legalWatchlist", "lawReview"],
+    settings: ["meta", "categories", "guideChecklistChecked"]
+  };
+  var sectionSnapshot = {}; // last loaded/saved JSON per section, for diff-based saves
+  function splitState(s){
+    var out = {};
+    Object.keys(SECTION_KEYS).forEach(function(sec){
+      var o = {};
+      SECTION_KEYS[sec].forEach(function(k){
+        if (k === "lawReview") o.lawReview = (s.meta && s.meta.lawReview) || { reviewedDate:"", reviewedBy:"" };
+        else if (k === "meta"){ var m = Object.assign({}, s.meta || {}); delete m.changeLog; delete m.lawReview; delete m.lastUpdated; o.meta = m; }
+        else o[k] = s[k];
+      });
+      out[sec] = o;
+    });
+    return out;
+  }
+  function mergeSections(rows){
+    var s = { meta:{}, categories:[], inspections:[], selfCheckRounds:[], materials:[], selfCheckTemplate:{} };
+    var latest = "";
+    rows.forEach(function(r){
+      var d = r.data || {};
+      if (r.updated_at && r.updated_at > latest) latest = r.updated_at;
+      (SECTION_KEYS[r.id] || []).forEach(function(k){
+        if (k === "lawReview") return;
+        if (d[k] !== undefined) s[k] = d[k];
+      });
+      if (r.id === "selfcheck" && d.lawReview) s.__lawReview = d.lawReview;
+    });
+    if (!s.meta) s.meta = {};
+    if (s.__lawReview){ s.meta.lawReview = s.__lawReview; delete s.__lawReview; }
+    s.meta.lastUpdated = latest || s.meta.lastUpdated;
+    return s;
+  }
+  var readableSections = {};
   async function loadStateFromServer(){
-    var raw = null;
+    var rows = [];
     if (sb){
-      var res = await sb.from("app_state").select("data").eq("id", APP_STATE_ROW_ID).maybeSingle();
+      var res = await sb.from("app_state").select("id,data,updated_at");
       if (res.error) throw res.error;
-      raw = res.data ? res.data.data : null;
+      rows = res.data || [];
     }
-    applyState(raw);
+    readableSections = {};
+    rows.forEach(function(r){ readableSections[r.id] = true; });
+    applyState(mergeSections(rows));
+    var parts = splitState(state);
+    sectionSnapshot = {};
+    Object.keys(parts).forEach(function(sec){ sectionSnapshot[sec] = JSON.stringify(parts[sec]); });
   }
   function applyState(raw){
     state = raw && typeof raw === "object" ? raw : {meta:{},categories:[],inspections:[],selfCheckRounds:[],materials:[],selfCheckTemplate:{}};
@@ -834,9 +882,8 @@
   function saveUiState(){
     try {
       sessionStorage.setItem(UI_STATE_KEY, JSON.stringify({
-        editMode: editMode,
+        editToggle: editToggle,
         editorName: editorName,
-        activeTab: activeTab,
         inspectionViewMode: inspectionViewMode,
         selectedRoundId: selectedRoundId
       }));
@@ -847,12 +894,8 @@
       var raw = sessionStorage.getItem(UI_STATE_KEY);
       if (!raw) return;
       var s = JSON.parse(raw);
-      if (s.editMode) editMode = true;
-      if (s.editorName) editorName = s.editorName;
-      // "materials" (자료실) was removed as a standalone tab — a session saved before
-      // that change could still have it stashed; fall back to the dashboard instead of
-      // restoring a tab whose view section no longer exists.
-      if (s.activeTab && s.activeTab !== "materials") activeTab = s.activeTab;
+      if (s.editToggle) editToggle = true;
+      // the current screen comes from the URL hash (see parseHash), not from here
       if (s.inspectionViewMode) inspectionViewMode = s.inspectionViewMode;
       if (s.selectedRoundId) selectedRoundId = s.selectedRoundId;
     } catch(e){}
@@ -945,94 +988,227 @@
     return list.filter(function(i){ return sevGroup === "advisory" ? i.severity === "개선권고" : i.severity !== "개선권고"; });
   }
 
-  /* ---------- rendering: shell ---------- */
+  /* ---------- permissions ---------- */
+  var MY = null;          // my user_permissions row
+  var PERMS = {};         // { menu: "none"|"read"|"write"|"edit"|"manage" }
+  var LEVELS = ["none","read","write","edit","manage"];
+  var LEVEL_LABEL = { none:"없음", read:"읽기", write:"쓰기", edit:"편집", manage:"관리" };
+  var MENUS = [
+    { key:"manual", label:"대응 매뉴얼" },
+    { key:"response", label:"감독 대응(자료 취합)" },
+    { key:"ledger_findings", label:"관리대장 · 적발 사항" },
+    { key:"ledger_rounds", label:"관리대장 · 근로감독 이력" },
+    { key:"ledger_selfcheck", label:"관리대장 · 모의점검" },
+    { key:"library", label:"자료실" },
+    { key:"admin", label:"관리(사용자·권한·설정)" }
+  ];
+  var SECTION_LABEL = { findings:"관리대장 · 적발 사항", rounds:"관리대장 · 근로감독 이력", selfcheck:"관리대장 · 모의점검", settings:"관리 · 기본 설정" };
+  var SECTION_MENU = { findings:"ledger_findings", rounds:"ledger_rounds", selfcheck:"ledger_selfcheck", settings:"admin" };
+  function lvl(menu){
+    if (PERMS.admin === "manage") return 4;
+    return Math.max(0, LEVELS.indexOf(PERMS[menu] || "none"));
+  }
+  function can(menu, need){ return lvl(menu) >= LEVELS.indexOf(need) && LEVELS.indexOf(need) > 0; }
+  function canLedgerAny(need){ return can("ledger_findings",need) || can("ledger_rounds",need) || can("ledger_selfcheck",need); }
+  async function logAudit(menu, action, detail){
+    try { if (sb) await sb.from("audit_log").insert({ menu: menu, action: action, detail: String(detail||"").slice(0,500) }); } catch(e){}
+  }
+
+  /* ---------- shell & routing ---------- */
+  var LEDGER_TABS = [
+    { id:"dashboard", label:"관리 현황", menu:null },
+    { id:"findings", label:"적발 사항", menu:"ledger_findings" },
+    { id:"inspections", label:"근로감독 이력 (문서)", menu:"ledger_rounds" },
+    { id:"selfcheck", label:"모의점검", menu:"ledger_selfcheck" }
+  ];
+  var LEDGER_HELP = { dashboard:"guide-dashboard", findings:"guide-finding", inspections:"guide-round", selfcheck:"guide-selfcheck" };
+  function isLedgerTab(t){ return LEDGER_TABS.some(function(x){ return x.id === t; }); }
+  function ledgerTabVisible(t){
+    if (t.id === "dashboard") return canLedgerAny("read");
+    if (t.id === "inspections") return can("ledger_rounds","read") || can("ledger_findings","read");
+    return can(t.menu, "read");
+  }
+  function topMenus(){
+    var m = [{ id:"home", label:"홈", href:"#/home" }];
+    if (can("manual","read")) m.push({ id:"manual", label:"대응 매뉴얼", href:"#/manual/" + (currentManualId || "") });
+    if (can("response","read")) m.push({ id:"response", label:"감독 대응", href:"#/response" + (currentInspId ? "/" + currentInspId : "") });
+    if (canLedgerAny("read")) m.push({ id:"ledger", label:"리스크 관리대장", href:"#/ledger/" + (isLedgerTab(lastLedgerTab) ? lastLedgerTab : "dashboard") });
+    if (can("library","read")) m.push({ id:"library", label:"자료실", href:"#/library" });
+    if (can("admin","manage")) m.push({ id:"admin", label:"관리", href:"#/admin" });
+    return m;
+  }
+  var currentManualId = "";
+  var currentInspId = "";
+  var lastLedgerTab = "dashboard";
+  var editToggle = false; // user's "편집모드" switch for ledger screens
+
+  function hashForState(){
+    if (activeTab === "manual") return "#/manual/" + (currentManualId || "");
+    if (activeTab === "response") return "#/response" + (currentInspId ? "/" + currentInspId : "");
+    if (isLedgerTab(activeTab)) return "#/ledger/" + activeTab;
+    return "#/" + (activeTab || "home");
+  }
+  function parseHash(){
+    var h = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+    var p = h.split("/");
+    var top = p[0] || "home";
+    if (top === "manual"){ activeTab = "manual"; currentManualId = p[1] || ""; }
+    else if (top === "response"){ activeTab = "response"; currentInspId = p[1] || ""; }
+    else if (top === "ledger"){ activeTab = isLedgerTab(p[1]) ? p[1] : "dashboard"; }
+    else if (top === "library"){ activeTab = "library"; libraryFocus = p[1] || ""; }
+    else if (top === "admin"){ activeTab = "admin"; }
+    else { activeTab = "home"; }
+    // fall back if no permission
+    if (activeTab === "manual" && !can("manual","read")) activeTab = "home";
+    if (activeTab === "response" && !can("response","read")) activeTab = "home";
+    if (activeTab === "library" && !can("library","read")) activeTab = "home";
+    if (activeTab === "admin" && !can("admin","manage")) activeTab = "home";
+    if (isLedgerTab(activeTab)){
+      var t = LEDGER_TABS.filter(function(x){ return x.id === activeTab; })[0];
+      if (!ledgerTabVisible(t)) activeTab = canLedgerAny("read") ? "dashboard" : "home";
+      else lastLedgerTab = activeTab;
+    }
+  }
+  var libraryFocus = "";
+  var routing = false;
+  window.addEventListener("hashchange", function(){
+    if (routing || !MY) return;
+    parseHash();
+    render();
+  });
+
   function render(){
     var app = document.getElementById("app");
+    var want = hashForState();
+    if (location.hash !== want){ routing = true; history.replaceState(null, "", want); routing = false; }
+    if (isLedgerTab(activeTab)) lastLedgerTab = activeTab;
+    document.body.classList.remove("nav-open");
     app.innerHTML = shellTemplate();
     wireShell();
     renderActiveTab();
   }
 
+  function sideFor(){
+    if (activeTab === "manual") return '<aside class="side" id="side">' + mobileGnb() + manualSidebar() + '</aside>';
+    if (isLedgerTab(activeTab)){
+      return '<aside class="side" id="side">' + mobileGnb() +
+        '<div class="side-title">RISK LEDGER</div><div class="side-sec">근로감독 리스크 관리대장</div>' +
+        LEDGER_TABS.filter(ledgerTabVisible).map(function(t){
+          return '<a class="side-link' + (t.id === activeTab ? ' on' : '') + '" href="#/ledger/' + t.id + '">' + esc(t.label) + '</a>';
+        }).join("") +
+        '<div style="border-top:1px solid var(--line);margin:14px 6px;padding-top:14px;" id="editToggleWrap"></div>' +
+      '</aside>';
+    }
+    return '<aside class="side" id="side" style="display:none">' + mobileGnb() + '</aside>';
+  }
+  function mobileGnb(){
+    var cur = isLedgerTab(activeTab) ? "ledger" : activeTab;
+    return '<div class="m-gnb">' + topMenus().map(function(m){ return '<a href="' + m.href + '" class="' + (m.id === cur ? "on" : "") + '">' + esc(m.label) + '</a>'; }).join("") + '</div>';
+  }
   function shellTemplate(){
+    var cur = isLedgerTab(activeTab) ? "ledger" : activeTab;
+    var hasSide = activeTab === "manual" || isLedgerTab(activeTab);
     return (
-      '<div class="shell">' +
-        '<div class="topbar"><div class="topbar-inner">' +
-          '<div class="brand-row">' +
-            '<div class="brand">' +
-              '<h1>' + esc(state.meta.title || TITLE) + '</h1>' +
-              (state.meta.orgName ? '<span class="org">' + esc(state.meta.orgName) + '</span>' : '') +
-            '</div>' +
-            '<div class="topbar-actions" id="editToggleWrap"></div>' +
-          '</div>' +
-          '<nav class="tabs" role="tablist">' +
-            tabBtn("guide","근로감독 안내") +
-            tabBtn("dashboard","대시보드") +
-            tabBtn("findings","적발 사항") +
-            tabBtn("inspections","근로감독 이력") +
-            tabBtn("selfcheck","모의점검") +
-            tabBtn("settings","설정") +
-          '</nav>' +
-        '</div></div>' +
-        '<section class="view" id="view-guide"></section>' +
-        '<section class="view" id="view-dashboard"></section>' +
-        '<section class="view" id="view-findings"></section>' +
-        '<section class="view" id="view-inspections"></section>' +
-        '<section class="view" id="view-selfcheck"></section>' +
-        '<section class="view" id="view-settings"></section>' +
-        '<p class="footer-note">최근 저장: ' + (state.meta.lastUpdated ? fmtDate(state.meta.lastUpdated) + ' ' + (state.meta.lastUpdated.split("T")[1]||"").slice(0,5) : "-") +
-          ' · 이 페이지의 실제 저장 권한은 등록된 편집자 계정(로그인) 기준입니다.</p>' +
+      '<header class="hd"><div class="hd-in">' +
+        '<button class="menu-btn" id="menuBtn" aria-label="메뉴 열기">☰</button>' +
+        '<a class="brand" href="#/home">' + (window.LOGO_SRC ? '<img src="' + window.LOGO_SRC + '" alt="ConnectWave">' : '') + '<span class="sep"></span><span class="nm">' + esc(TITLE) + '</span></a>' +
+        '<nav class="gnb">' + topMenus().map(function(m){ return '<a href="' + m.href + '" class="' + (m.id === cur ? "on" : "") + '">' + esc(m.label) + '</a>'; }).join("") + '</nav>' +
+        '<div class="hd-r"><span class="who" title="' + esc(currentUser && currentUser.email) + '">' + esc((MY && MY.name) || "") + ' · ' + esc(currentUser && currentUser.email) + '</span>' +
+          '<button class="btn sm ghost" id="btnLogout">로그아웃</button></div>' +
+      '</div></header>' +
+      '<div class="scrim" id="scrim"></div>' +
+      '<div class="wrap">' + sideFor() +
+        '<main class="main">' +
+          '<section class="view" id="view-home"></section>' +
+          '<section class="view" id="view-manual"></section>' +
+          '<section class="view" id="view-response"></section>' +
+          '<section class="view" id="view-dashboard"></section>' +
+          '<section class="view" id="view-findings"></section>' +
+          '<section class="view" id="view-inspections"></section>' +
+          '<section class="view" id="view-selfcheck"></section>' +
+          '<section class="view" id="view-library"></section>' +
+          '<section class="view" id="view-admin"></section>' +
+          '<p class="footer-note">' + esc(TITLE) + ' ｜ HRM팀 노무관리파트 · 데이터 최근 저장 ' + (state.meta.lastUpdated ? fmtDate(state.meta.lastUpdated) : "-") + ' · 권한은 계정별로 서버에서 확인됩니다</p>' +
+        '</main>' +
       '</div>' +
       '<div id="modalRoot"></div>'
-    );
+    ) + (hasSide ? '' : '<style>.wrap .side{display:none}@media (max-width:980px){.wrap .side{display:block}}</style>');
   }
-  function tabBtn(id, label){
-    return '<button class="tab" role="tab" aria-selected="' + (activeTab===id) + '" data-tab="' + id + '">' + label + '</button>';
-  }
+  function tabBtn(){ return ""; }
 
   function wireShell(){
-    $all(".tab").forEach(function(btn){
-      btn.addEventListener("click", function(){
-        activeTab = btn.getAttribute("data-tab");
-        saveUiState();
-        $all(".tab").forEach(function(b){ b.setAttribute("aria-selected", b===btn); });
-        $all(".view").forEach(function(v){ v.classList.remove("active"); });
-        document.getElementById("view-"+activeTab).classList.add("active");
-        renderActiveTab();
-      });
-    });
-    document.getElementById("view-"+activeTab).classList.add("active");
+    var v = document.getElementById("view-" + activeTab);
+    if (v) v.classList.add("active");
+    $("#btnLogout").addEventListener("click", async function(){ if (sb) await sb.auth.signOut(); window.location.hash = ""; window.location.reload(); });
+    $("#menuBtn").addEventListener("click", function(){ document.body.classList.toggle("nav-open"); });
+    $("#scrim").addEventListener("click", function(){ document.body.classList.remove("nav-open"); });
     renderEditToggle();
   }
 
+  // The ledger screens keep their original "편집모드" behaviour; the toggle only appears
+  // when the user has at least write permission on some ledger menu, and each screen
+  // narrows editMode to the menu it belongs to (see renderActiveTab).
   function renderEditToggle(){
     var wrap = document.getElementById("editToggleWrap");
     if (!wrap) return;
-    var who = '<span class="hint" style="margin-right:10px;font-size:12px;">' + esc((currentUser && currentUser.email) || editorName || "") + '</span>';
-    var logoutBtn = '<button class="btn sm ghost" id="btnLogout" style="margin-right:6px;">로그아웃</button>';
-    if (editMode){
-      wrap.innerHTML = who +
-        '<span class="badge good" style="margin-right:6px;"><span class="dot"></span>편집모드</span>' +
-        '<button class="btn sm" id="btnExitEdit" style="margin-right:6px;">보기 전용으로</button>' + logoutBtn;
-      $("#btnExitEdit").addEventListener("click", function(){ editMode=false; saveUiState(); render(); });
-    } else {
-      wrap.innerHTML = who + '<button class="btn primary sm" id="btnEnterEdit" style="margin-right:6px;">✎ 편집모드</button>' + logoutBtn;
-      $("#btnEnterEdit").addEventListener("click", function(){ editMode=true; saveUiState(); render(); });
+    if (!canLedgerAny("write")){
+      wrap.innerHTML = '<div class="hint" style="font-size:12px;padding:0 6px;">보기 전용 권한입니다.</div>';
+      return;
     }
-    $("#btnLogout").addEventListener("click", async function(){
-      if (sb) await sb.auth.signOut();
-      window.location.reload();
-    });
+    wrap.innerHTML = editToggle
+      ? '<span class="badge good" style="margin:0 6px 8px;"><span class="dot"></span>편집모드</span><button class="btn sm" id="btnExitEdit" style="width:100%;justify-content:center;">보기 전용으로</button>'
+      : '<button class="btn primary sm" id="btnEnterEdit" style="width:100%;justify-content:center;">✎ 편집모드</button>';
+    var b1 = document.getElementById("btnExitEdit"), b2 = document.getElementById("btnEnterEdit");
+    if (b1) b1.addEventListener("click", function(){ editToggle = false; saveUiState(); render(); });
+    if (b2) b2.addEventListener("click", function(){ editToggle = true; saveUiState(); render(); });
+  }
+
+  function ledgerEditFor(tab){
+    if (!editToggle) return false;
+    if (tab === "findings") return can("ledger_findings","write");
+    if (tab === "inspections") return can("ledger_rounds","write") || can("ledger_findings","write");
+    if (tab === "selfcheck") return can("ledger_selfcheck","write");
+    if (tab === "dashboard") return false;
+    return false;
+  }
+  function pruneDeleteButtons(el, menuKeys){
+    var ok = menuKeys.some(function(m){ return can(m, "edit"); });
+    if (ok) return;
+    $all("[data-del-insp],[data-del-round],[data-del-round-material],[data-del-round-attach],[data-del-legal],[data-del-check-round]", el).forEach(function(b){ b.remove(); });
   }
 
   function renderActiveTab(){
-    if (activeTab === "guide") renderGuide();
-    else if (activeTab === "dashboard") renderDashboard();
+    var v = document.getElementById("view-" + activeTab);
+    if (activeTab === "home") return renderHome();
+    if (activeTab === "manual") return renderManual();
+    if (activeTab === "response") return renderResponse();
+    if (activeTab === "library") return renderLibrary();
+    if (activeTab === "admin") return renderAdmin();
+    editMode = ledgerEditFor(activeTab);
+    if (activeTab === "dashboard") renderDashboard();
     else if (activeTab === "findings") renderFindings();
     else if (activeTab === "inspections") renderInspections();
     else if (activeTab === "selfcheck") renderSelfCheck();
-    else if (activeTab === "settings") renderSettings();
+    if (v){
+      pruneDeleteButtons(v, activeTab === "findings" ? ["ledger_findings"] : activeTab === "selfcheck" ? ["ledger_selfcheck"] : ["ledger_rounds","ledger_findings"]);
+      injectLedgerHelp(v, activeTab);
+    }
   }
-
+  function injectLedgerHelp(v, tab){
+    var pid = LEDGER_HELP[tab];
+    if (!pid || !can("manual","read")) return;
+    var box = document.createElement("details");
+    box.className = "help-box";
+    box.innerHTML = '<summary>ⓘ 이 화면 사용법 보기</summary><div class="doc" id="helpBody">불러오는 중…</div>';
+    v.insertBefore(box, v.firstChild);
+    box.addEventListener("toggle", async function(){
+      if (!box.open || box.dataset.loaded) return;
+      var page = await getManualPage(pid);
+      box.dataset.loaded = "1";
+      box.querySelector("#helpBody").innerHTML = page ? ('<h3 style="margin-top:0">' + esc(page.title) + '</h3>' + (page.body_html || "")) : "사용법 문서를 찾을 수 없습니다.";
+      wireDocLinks(box);
+    });
+  }
   /* ---------- dashboard ---------- */
   function renderDashboard(){
     var el = document.getElementById("view-dashboard");
@@ -1345,6 +1521,7 @@
           '<div style="padding:0 16px 16px;"><button class="btn primary sm" id="btnPickRoundEmpty">감독 시기 선택하기</button></div></div>';
       } else {
         html += renderRoundMetaAndMaterials(curRound);
+        html += renderLiveFinalsForRound(curRound);
         var roundItems = state.inspections.filter(function(i){ return i.roundId === curRound.id; });
         html += renderCategoryGroups(roundItems, {addPresetRoundId: curRound.id, hideEmpty: true});
         if (!roundItems.length){
@@ -2431,202 +2608,6 @@
     });
   }
 
-  /* ---------- 근로감독 안내 tab ---------- */
-  function renderGuide(){
-    var el = document.getElementById("view-guide");
-    var html = '<div class="panel-head" style="margin-top:0;"><div><h2 style="font-size:19px;">근로감독 안내</h2><div class="desc">근로감독관집무규정을 기준으로 근로감독의 종류·절차·확인서류·조치기준을 정리한 참고 자료입니다.</div></div></div>';
-
-    html += '<div class="panel"><div class="panel-head"><h2>근로감독이란</h2></div>' +
-      '<div class="intro-text">근로감독은 고용노동부 소속 근로감독관이 사업장을 방문하거나 자료를 확인하여 근로기준법 등 노동관계법령의 준수 여부를 점검하고, 위반사항이 확인되면 시정지시·시정명령·과태료·형사처벌 등의 조치를 취하는 행정 활동입니다. 근로감독관집무규정이 감독의 종류·절차·조치기준을 정하고 있으며, 이 탭은 그 핵심 내용을 정리해 상시 점검 체계를 갖추는 데 참고하기 위한 자료입니다.</div>' +
-    '</div>';
-
-    html += '<div class="panel"><div class="panel-head"><h2>근로감독의 종류</h2><div class="desc">근로감독관집무규정 제12조 기준</div></div>' +
-      '<div class="type-grid">' +
-      GUIDE_TYPES.map(function(t){
-        return '<div class="type-card' + (t.tagClass ? ' ' + t.tagClass : '') + '">' +
-          '<div class="tname"><span class="dot"></span>' + esc(t.name) + '</div>' +
-          '<p>' + esc(t.desc) + '</p>' +
-          '<span class="tag">' + esc(t.tag) + '</span>' +
-        '</div>';
-      }).join("") +
-      '</div></div>';
-
-    html += '<div class="panel"><div class="panel-head"><h2>근로감독 절차</h2><div class="desc">근로감독관집무규정 및 실무 안내를 종합한 일반적 흐름 (정기감독 기준 · 수시/특별감독은 사전통보 없이 진행될 수 있음)</div></div>' +
-      '<div class="flow">' +
-      GUIDE_STEPS.map(function(s, i){
-        var branchHtml = "";
-        if (s.branch && s.branch.length){
-          branchHtml = '<div class="flow-branch">' +
-            s.branch.map(function(b){
-              return '<div class="bopt ' + esc(b.cls) + '"><b>' + esc(b.label) + '</b>' + esc(b.text) + '</div>';
-            }).join("") +
-          '</div>';
-        }
-        return '<div class="flow-step">' +
-          '<div class="flow-num">' + (i+1) + '</div>' +
-          '<div class="flow-card">' +
-            '<div class="ft">' + esc(s.title) + (s.ref ? ('<span class="fref">' + esc(s.ref) + '</span>') : '') + '</div>' +
-            '<div class="fd">' + esc(s.desc) + '</div>' +
-            branchHtml +
-          '</div>' +
-        '</div>';
-      }).join("") +
-      '</div></div>';
-
-    html += '<div class="panel"><div class="panel-head"><h2>사업장 감독 시 주요 확인 서류 체크리스트</h2><div class="desc">근로감독관집무규정 별표2 · 13개 법령분야' + (editMode ? '' : ' · 편집모드에서 항목을 체크할 수 있습니다') + '</div></div>' +
-      '<details class="cat"' + (guideCatOpen.checklist ? ' open' : '') + ' data-guide-cat="checklist">' +
-        '<summary><span class="cat-title"><span class="cat-chevron">▸</span>사업장감독 시 점검 확인 주요 서류 (별표2)<span class="badge">13개 분야</span></span></summary>' +
-        '<div class="cat-body">' +
-        GUIDE_CHECKLIST.map(function(cat){
-          var subId = "chk-" + cat.no;
-          return '<details class="subcat"' + (guideSubcatOpen[subId] ? ' open' : '') + ' data-guide-subcat="' + subId + '">' +
-            '<summary><span class="subcat-chevron">▸</span>' + cat.no + '. ' + esc(cat.title) + '</summary>' +
-            '<div class="subcat-body"><div class="checklist-grid">' +
-              cat.items.map(function(item, idx){
-                var itemId = "g2-" + cat.no + "-" + idx;
-                var checked = !!((state.guideChecklistChecked || {})[itemId]);
-                return '<div class="ci"><input type="checkbox" id="gc-' + itemId + '" data-guide-check="' + itemId + '"' + (checked ? ' checked' : '') + (editMode ? '' : ' disabled') + '><label for="gc-' + itemId + '">' + esc(item) + '</label></div>';
-              }).join("") +
-            '</div></div>' +
-          '</details>';
-        }).join("") +
-        '</div>' +
-      '</details>' +
-    '</div>';
-
-    html += '<div class="panel"><div class="panel-head"><h2>개별근로관계법 위반사항 조치기준</h2><div class="desc">근로감독관집무규정 별표3 · ' + GUIDE_SANCTIONS.length + '개 법률</div></div>' +
-      '<details class="cat"' + (guideCatOpen.sanctions ? ' open' : '') + ' data-guide-cat="sanctions">' +
-        '<summary><span class="cat-title"><span class="cat-chevron">▸</span>개별근로관계법 위반사항 조치기준 (별표3)<span class="badge">' + GUIDE_SANCTIONS.length + '개 법률</span></span></summary>' +
-        '<div class="cat-body">' +
-        '<div class="sanction-note"><b>일반조치기준</b><ul>' +
-          GUIDE_SANCTION_GENERAL.map(function(g){ return '<li>' + esc(g) + '</li>'; }).join("") +
-        '</ul></div>' +
-        GUIDE_SANCTIONS.map(function(law){
-          var subId = "sanc-" + law.law;
-          var fineRows = (GUIDE_FINES[law.law] || []);
-          var fineTable = fineRows.length ? (
-            '<div class="fine-subhead">과태료 부과기준 (위반횟수별 금액)</div>' +
-            '<table class="tbl"><thead><tr><th>법조문</th><th>위반행위</th><th>1차</th><th>2차</th><th>3차 이상</th></tr></thead><tbody>' +
-              fineRows.map(function(f){
-                return '<tr><td class="mono">' + esc(f[0]) + '</td><td>' + esc(f[1]) + '</td><td class="mono">' + esc(f[2]) + '</td><td class="mono">' + esc(f[3]) + '</td><td class="mono">' + esc(f[4]) + '</td></tr>';
-              }).join("") +
-            '</tbody></table>'
-          ) : '';
-          return '<details class="subcat"' + (guideSubcatOpen[subId] ? ' open' : '') + ' data-guide-subcat="' + esc(subId) + '">' +
-            '<summary><span class="subcat-chevron">▸</span>' + esc(law.law) + '<span class="badge neutral">' + law.rows.length + '개 조문</span></summary>' +
-            '<div class="subcat-body scrollx"><table class="tbl"><thead><tr><th>법조문</th><th>위반사례</th><th>조치기준</th></tr></thead><tbody>' +
-              law.rows.map(function(r){
-                return '<tr><td class="mono">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td><td>' + esc(r[2]) + '</td></tr>';
-              }).join("") +
-            '</tbody></table>' +
-            fineTable +
-            '</div>' +
-          '</details>';
-        }).join("") +
-        '</div>' +
-      '</details>' +
-    '</div>';
-
-    el.innerHTML = html;
-    bindGuideChecklist(el);
-  }
-  function bindGuideChecklist(el){
-    $all("[data-guide-check]", el).forEach(function(cb){
-      cb.addEventListener("change", function(){
-        if (!editMode){ cb.checked = !cb.checked; return; }
-        var id = cb.getAttribute("data-guide-check");
-        if (!state.guideChecklistChecked) state.guideChecklistChecked = {};
-        state.guideChecklistChecked[id] = cb.checked;
-        commit("체크리스트 항목 " + (cb.checked ? "체크" : "체크 해제") + " (" + id + ")");
-      });
-    });
-    $all("details[data-guide-cat]", el).forEach(function(d){
-      d.addEventListener("toggle", function(){
-        guideCatOpen[d.getAttribute("data-guide-cat")] = d.open;
-      });
-    });
-    $all("details[data-guide-subcat]", el).forEach(function(d){
-      d.addEventListener("toggle", function(){
-        guideSubcatOpen[d.getAttribute("data-guide-subcat")] = d.open;
-      });
-    });
-  }
-
-  /* ---------- settings tab ---------- */
-  function renderSettings(){
-    var el = document.getElementById("view-settings");
-    var html = '<div class="panel-head" style="margin-top:0;"><div><h2 style="font-size:19px;">설정</h2></div></div>';
-
-    html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">권한 안내</h2>' +
-      '<div class="kv">' +
-      '<div class="row"><span>로그인 계정</span><span>' + esc((currentUser && currentUser.email) || "-") + '</span></div>' +
-      '<div class="row"><span>실제 저장 권한</span><span>Supabase에 등록된 <b>편집자 계정</b>으로 로그인한 사람만 저장 가능 (관리자에게 계정 등록 요청)</span></div>' +
-      '</div></div>';
-
-    html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">비밀번호 변경</h2>' +
-      '<form class="f" id="pwChangeForm">' +
-        '<input type="password" name="pw1" placeholder="새 비밀번호 (6자 이상)" required minlength="6" autocomplete="new-password">' +
-        '<input type="password" name="pw2" placeholder="새 비밀번호 확인" required minlength="6" autocomplete="new-password">' +
-        '<div class="form-actions"><button type="submit" class="btn sm" id="pwChangeBtn">비밀번호 변경</button></div>' +
-      '</form>' +
-      '<p class="hint" style="margin-top:8px;font-size:12px;">현재 로그인된 계정(' + esc((currentUser && currentUser.email) || "") + ')의 비밀번호만 바뀝니다. 다른 사람의 비밀번호는 여기서 바꿀 수 없습니다.</p>' +
-    '</div>';
-
-    html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">기본 설정</h2>';
-    if (editMode){
-      html += '<form class="f" id="settingsForm">' +
-        field("문서 제목", 'input', 'title', state.meta.title, 'text') +
-        field("회사/조직명", 'input', 'orgName', state.meta.orgName, 'text') +
-        field("기본 재적발 기준기간(년)", 'input', 'defaultRepeatWindowYears', state.meta.defaultRepeatWindowYears, 'number') +
-        field("모의점검 주기(개월)", 'input', 'selfCheckIntervalMonths', state.meta.selfCheckIntervalMonths, 'number') +
-        '<div class="form-actions"><button type="submit" class="btn primary sm">저장</button></div>' +
-      '</form>';
-    } else {
-      html += '<div class="kv">' +
-        '<div class="row"><span>회사/조직명</span><span>' + esc(state.meta.orgName||"-") + '</span></div>' +
-        '<div class="row"><span>기본 재적발 기준기간</span><span>' + state.meta.defaultRepeatWindowYears + '년</span></div>' +
-        '<div class="row"><span>모의점검 주기</span><span>' + state.meta.selfCheckIntervalMonths + '개월</span></div>' +
-      '</div>';
-    }
-    html += '</div>';
-
-    html += '<div class="panel"><h2 style="font-size:15px;margin-bottom:10px;">변경 이력</h2><ul class="changelog">' +
-      state.meta.changeLog.slice().reverse().slice(0,30).map(function(c){
-        return '<li><time>' + esc(c.date) + '</time><span>' + esc(c.editor||"") + ' — ' + esc(c.summary) + '</span></li>';
-      }).join("") + '</ul></div>';
-
-    el.innerHTML = html;
-    var pwForm = document.getElementById("pwChangeForm");
-    if (pwForm){
-      pwForm.addEventListener("submit", async function(e){
-        e.preventDefault();
-        var fd = new FormData(pwForm);
-        var p1 = fd.get("pw1") || "";
-        var p2 = fd.get("pw2") || "";
-        if (p1.length < 6){ alert("비밀번호는 6자 이상이어야 합니다."); return; }
-        if (p1 !== p2){ alert("새 비밀번호 확인이 일치하지 않습니다."); return; }
-        var btn = document.getElementById("pwChangeBtn");
-        btn.disabled = true;
-        var res = await sb.auth.updateUser({ password: p1 });
-        btn.disabled = false;
-        if (res.error){ alert("비밀번호 변경에 실패했습니다: " + res.error.message); return; }
-        pwForm.reset();
-        toast("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.");
-      });
-    }
-    if (editMode){
-      var sf = document.getElementById("settingsForm");
-      sf.addEventListener("submit", function(e){
-        e.preventDefault();
-        var fd = new FormData(sf);
-        state.meta.title = fd.get("title") || TITLE;
-        state.meta.orgName = fd.get("orgName") || "";
-        state.meta.defaultRepeatWindowYears = Number(fd.get("defaultRepeatWindowYears")) || 3;
-        state.meta.selfCheckIntervalMonths = Number(fd.get("selfCheckIntervalMonths")) || 6;
-        commit("기본 설정 변경");
-      });
-    }
-  }
   function confirmModal(msg, onOk){
     var body = '<h3>확인</h3><p class="hint" style="margin-bottom:16px;">' + esc(msg) + '</p>' +
       '<div class="modal-actions"><button class="btn ghost" id="cfCancel">취소</button><button class="btn danger" id="cfOk">삭제</button></div>';
@@ -2656,25 +2637,30 @@
     if (busy) return;
     if (!sb){ alert("저장소 연결이 초기화되지 않았습니다. 새로고침 후 다시 시도해주세요."); return; }
     busy = true;
-    state.meta.lastUpdated = new Date().toISOString();
-    state.meta.changeLog.push({ date: todayStr(), editor: editorName || "익명", summary: summary });
-    if (state.meta.changeLog.length > 200) state.meta.changeLog = state.meta.changeLog.slice(-200);
+    var nowIso = new Date().toISOString();
+    state.meta.lastUpdated = nowIso;
     saveUiState();
-    lastSavedSnapshotAt = state.meta.lastUpdated;
+    lastSavedSnapshotAt = nowIso;
+    var parts = splitState(state);
+    var changed = Object.keys(parts).filter(function(sec){ return JSON.stringify(parts[sec]) !== sectionSnapshot[sec]; });
     try {
-      var res = await sb.from("app_state").upsert({
-        id: APP_STATE_ROW_ID,
-        data: state,
-        updated_at: new Date().toISOString(),
-        updated_by: (currentUser && currentUser.email) || editorName || ""
-      }, { onConflict: "id" });
-      if (res.error) throw res.error;
+      for (var i=0;i<changed.length;i++){
+        var sec = changed[i];
+        var res = await sb.from("app_state").update({
+          data: parts[sec], updated_at: nowIso, updated_by: (currentUser && currentUser.email) || ""
+        }).eq("id", sec).select("id");
+        if (res.error) throw res.error;
+        if (!res.data || !res.data.length) throw new Error("'" + SECTION_LABEL[sec] + "' 저장 권한이 없습니다. 관리자에게 권한을 요청하세요.");
+        sectionSnapshot[sec] = JSON.stringify(parts[sec]);
+      }
+      if (changed.length) logAudit(SECTION_MENU[changed[0]] || "ledger", "save", summary);
       busy = false;
-      toast("저장되었습니다.");
+      toast(changed.length ? "저장되었습니다." : "변경된 내용이 없습니다.");
       render();
     } catch(err){
       busy = false;
       alert("저장 중 문제가 발생했습니다: " + ((err && err.message) || err));
+      try { await loadStateFromServer(); } catch(e){}
       render();
     }
   }
@@ -2683,23 +2669,24 @@
   function subscribeRealtime(){
     if (!sb) return;
     sb.channel("app_state_changes")
-      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "app_state", filter: "id=eq." + APP_STATE_ROW_ID }, function(payload){
-        var incoming = payload.new && payload.new.data;
-        if (!incoming) return;
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "app_state" }, async function(payload){
+        var row = payload.new || {};
         // Skip the echo of our own just-committed save (already reflected locally).
-        if (incoming.meta && incoming.meta.lastUpdated && incoming.meta.lastUpdated === lastSavedSnapshotAt) return;
-        state = incoming;
-        normalizeState();
-        toast("다른 편집자의 변경 사항이 반영되었습니다.");
-        render();
+        if (row.updated_at && lastSavedSnapshotAt && new Date(row.updated_at).getTime() === new Date(lastSavedSnapshotAt).getTime()) return;
+        if (busy) return;
+        try { await loadStateFromServer(); } catch(e){ return; }
+        if (isLedgerTab(activeTab) || activeTab === "home") { toast("다른 사용자의 변경 사항이 반영되었습니다."); renderActiveTab(); }
       })
+      .on("postgres_changes", { event: "*", schema: "public", table: "collect_items" }, function(){ onLiveChange(); })
+      .on("postgres_changes", { event: "*", schema: "public", table: "collect_files" }, function(){ onLiveChange(); })
+      .on("postgres_changes", { event: "*", schema: "public", table: "inspections_live" }, function(){ onLiveChange(); })
       .subscribe();
   }
 
   /* ---------- auth screens ---------- */
   function renderCenteredScreen(innerHtml){
     var app = document.getElementById("app");
-    app.innerHTML = '<div class="auth-screen"><div class="auth-card">' + innerHtml + '</div></div>';
+    app.innerHTML = '<div class="auth-screen"><div class="auth-card">' + (window.LOGO_SRC ? '<img class="auth-logo" src="' + window.LOGO_SRC + '" alt="ConnectWave">' : '') + innerHtml + '</div></div>';
   }
   function renderLoadingScreen(msg){
     renderCenteredScreen('<h1 style="font-size:18px;margin-bottom:8px;">' + esc(TITLE) + '</h1><p class="hint">' + esc(msg||"불러오는 중...") + '</p>');
@@ -2707,7 +2694,7 @@
   function renderLoginScreen(errorMsg){
     renderCenteredScreen(
       '<h1 style="font-size:18px;margin-bottom:4px;">' + esc(TITLE) + '</h1>' +
-      '<p class="hint" style="margin-bottom:16px;">등록된 편집자 계정으로 로그인하세요.</p>' +
+      '<p class="hint" style="margin-bottom:16px;">회사 이메일 계정으로 로그인하세요. 메뉴와 권한은 계정별로 다르게 보입니다.</p>' +
       (errorMsg ? '<p class="hint" style="color:#c0392b;margin-bottom:10px;">' + esc(errorMsg) + '</p>' : '') +
       '<form id="loginForm" class="f">' +
         '<input type="email" id="loginEmail" placeholder="이메일" autocomplete="username" required>' +
@@ -2752,7 +2739,7 @@
   function renderNotEditorScreen(email){
     renderCenteredScreen(
       '<h1 style="font-size:18px;margin-bottom:4px;">' + esc(TITLE) + '</h1>' +
-      '<p class="hint" style="margin-bottom:16px;">' + esc(email) + ' 계정은 이 문서의 편집자로 등록되어 있지 않습니다. 관리자에게 등록을 요청해주세요.</p>' +
+      '<p class="hint" style="margin-bottom:16px;">' + esc(email) + ' 계정에 부여된 대시보드 권한이 없습니다. HRM팀 노무관리파트(관리자)에게 권한 등록을 요청해주세요.</p>' +
       '<button class="btn sm" id="btnBackToLogin">로그아웃</button>'
     );
     document.getElementById("btnBackToLogin").addEventListener("click", async function(){
@@ -2762,15 +2749,17 @@
   }
   async function afterLogin(user){
     if (!user){ renderLoginScreen(); return; }
-    renderLoadingScreen("편집자 확인 중...");
-    var chk = await sb.from("editors").select("id,email,name").eq("id", user.id).maybeSingle();
+    renderLoadingScreen("권한 확인 중...");
+    var chk = await sb.from("user_permissions").select("email,name,team,perms").eq("email", String(user.email||"").toLowerCase()).maybeSingle();
     if (chk.error || !chk.data){ renderNotEditorScreen(user.email); return; }
     currentUser = { id: user.id, email: user.email };
     isRegisteredEditor = true;
+    MY = chk.data;
+    PERMS = chk.data.perms || {};
     editorName = chk.data.name || user.email;
-    editMode = true;
+    editMode = false;
     renderLoadingScreen("데이터를 불러오는 중...");
-    try { await loadStateFromServer(); }
+    try { await loadStateFromServer(); await loadLive(); }
     catch(err){
       renderCenteredScreen('<p class="hint">데이터를 불러오지 못했습니다: ' + esc((err && err.message) || err) + '</p><button class="btn sm" id="btnRetry">다시 시도</button>');
       var rb = document.getElementById("btnRetry");
@@ -2779,8 +2768,641 @@
     }
     loadDraft();
     loadUiState();
+    parseHash();
     render();
     subscribeRealtime();
+    if (can("manual","read")) loadManual().then(function(){ if (activeTab === "manual") render(); }).catch(function(){});
+  }
+
+  /* =====================================================================
+     감독 대응(자료 취합) live data
+     ===================================================================== */
+  var LIVE = { inspections: [], items: [], files: [], users: [], loaded: false };
+  async function loadLive(){
+    LIVE = { inspections: [], items: [], files: [], users: [], loaded: true };
+    if (!sb) return;
+    if (can("response","read")){
+      var a = await sb.from("inspections_live").select("*").order("created_at", { ascending:false });
+      var b = await sb.from("collect_items").select("*").order("sort");
+      var c = await sb.from("collect_files").select("*").order("version");
+      var u = await sb.from("user_permissions").select("email,name,team");
+      LIVE.inspections = a.data || []; LIVE.items = b.data || []; LIVE.files = c.data || []; LIVE.users = u.data || [];
+    } else if (can("ledger_rounds","read")) {
+      // ledger readers without response access still see nothing from collect_* (RLS);
+      // final files are shown only to users who can read the response menu.
+    }
+  }
+  var liveTimer = null;
+  function onLiveChange(){
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(async function(){
+      try { await loadLive(); } catch(e){ return; }
+      if (activeTab === "response" || activeTab === "home" || activeTab === "inspections") renderActiveTab();
+    }, 400);
+  }
+  function itemsOf(inspId){ return LIVE.items.filter(function(i){ return i.inspection_id === inspId; }); }
+  function filesOf(itemId){ return LIVE.files.filter(function(f){ return f.item_id === itemId; }).sort(function(a,b){ return a.version - b.version; }); }
+  function finalOf(itemId){ return LIVE.files.filter(function(f){ return f.item_id === itemId && f.is_final; })[0] || null; }
+  function userLabel(email){
+    if (!email) return "-";
+    var u = LIVE.users.filter(function(x){ return x.email === String(email).toLowerCase(); })[0];
+    return u && u.name ? (u.name + (u.team ? " (" + u.team + ")" : "")) : email;
+  }
+  var STATUS_BADGE = { "요청":"neutral", "제출":"info", "반려":"danger", "최종확정":"good" };
+  function statusBadge(s){ return '<span class="badge ' + (STATUS_BADGE[s] || "neutral") + '">' + esc(s) + '</span>'; }
+  function fileLink(f){
+    return '<a href="#" data-storage-path="' + esc(f.storage_path) + '">📎 ' + esc(f.file_name) + '</a> <a href="#" data-storage-download-path="' + esc(f.storage_path) + '" data-storage-download-name="' + esc(f.file_name) + '" style="font-size:11px;">다운로드</a>';
+  }
+
+  /* =====================================================================
+     홈
+     ===================================================================== */
+  function renderHome(){
+    var el = document.getElementById("view-home");
+    var me = String(currentUser.email||"").toLowerCase();
+    var html = '<div class="page">';
+    html += '<div class="panel-head" style="margin:0"><div><h2 style="font-size:24px;">' + esc((MY && MY.name) || "") + '님, 안녕하세요</h2><div class="desc">근로감독 대응 매뉴얼, 감독 대응 자료 취합, 리스크 관리대장을 한곳에서 관리합니다.</div></div></div>';
+    html += '<div style="margin-top:10px">' + MENUS.map(function(m){ var l = PERMS.admin === "manage" ? "manage" : (PERMS[m.key] || "none"); return l === "none" ? "" : '<span class="perm-pill">' + esc(m.label) + ' · <b>' + LEVEL_LABEL[l] + '</b></span>'; }).join("") + '</div>';
+
+    if (can("response","read")){
+      var mine = LIVE.items.filter(function(i){ return (i.assignee_email||"").toLowerCase() === me && i.status !== "최종확정"; });
+      var activeInsp = LIVE.inspections.filter(function(x){ return x.status !== "종결"; });
+      html += '<div class="panel"><div class="panel-head"><div><h2>내 할 일</h2><div class="desc">나에게 배정된 자료 취합 항목 중 최종확정 전인 항목입니다.</div></div></div>';
+      if (!mine.length) html += '<div class="empty-row">배정된 항목이 없습니다.</div>';
+      else {
+        html += '<div class="scrollx"><table class="tbl"><thead><tr><th>감독</th><th>자료</th><th>마감</th><th>상태</th><th></th></tr></thead><tbody>' +
+          mine.map(function(i){ var ins = LIVE.inspections.filter(function(x){ return x.id === i.inspection_id; })[0] || {};
+            return '<tr><td>' + esc(ins.title||"") + '</td><td>' + esc(i.title) + (i.reject_reason ? '<div class="hint" style="font-size:12px;color:var(--danger-700)">반려 사유: ' + esc(i.reject_reason) + '</div>' : '') + '</td><td class="mono">' + (i.due_date ? fmtDate(i.due_date) : "-") + '</td><td>' + statusBadge(i.status) + '</td><td><a class="btn sm" href="#/response/' + i.inspection_id + '">열기</a></td></tr>'; }).join("") +
+          '</tbody></table></div>';
+      }
+      html += '</div>';
+      if (activeInsp.length){
+        html += '<div class="panel"><div class="panel-head"><div><h2>진행 중인 근로감독</h2></div></div><div class="hc-grid" style="margin-top:0">' +
+          activeInsp.map(function(x){ var its = itemsOf(x.id); var fin = its.filter(function(i){ return i.status === "최종확정"; }).length; var pct = its.length ? Math.round(fin*100/its.length) : 0;
+            return '<a class="hc" href="#/response/' + x.id + '"><h3>' + esc(x.title) + '</h3><p>' + esc(x.type||"") + (x.visit_date ? ' · 감독일 ' + fmtDate(x.visit_date) : '') + ' · ' + esc(x.status) + '</p><div class="progress"><span style="width:' + pct + '%"></span></div><p>최종확정 ' + fin + ' / ' + its.length + ' (' + pct + '%)</p></a>'; }).join("") + '</div></div>';
+      }
+    }
+    if (canLedgerAny("read")){
+      var watch = riskWatchlistGrouped().active, over = overdueList().filter(function(i){ return i.severity !== "개선권고"; });
+      html += '<div class="grid-stats" style="margin-top:18px">' +
+        statCard("가중처벌 적용기간 내", String(watch.length) + '<small>건</small>', "재적발 시 처벌 가중 위험", watch.length > 0) +
+        statCard("개선기한 초과", String(over.length) + '<small>건</small>', "시정지시·시정명령 기준", over.length > 0) +
+        statCard("최근 근로감독일", latestInspectionDate() ? fmtDate(latestInspectionDate()) : "이력 없음", "") + '</div>';
+    }
+    html += '<div class="hc-grid">';
+    if (can("manual","read")) html += '<a class="hc" href="#/manual/"><div class="ic">📘</div><h3>대응 매뉴얼</h3><p>감독 종류·절차, 단계별 대응, 처분 기준, 분야별 점검사항, 당사 사례</p></a>';
+    if (can("response","read")) html += '<a class="hc" href="#/response"><div class="ic">📥</div><h3>감독 대응 (자료 취합)</h3><p>감독이 나오면 취합 목록을 만들고 담당자가 자료를 올립니다. 최종본은 관리대장에 자동 연계됩니다.</p></a>';
+    if (canLedgerAny("read")) html += '<a class="hc" href="#/ledger/dashboard"><div class="ic">🗂️</div><h3>리스크 관리대장</h3><p>적발 사항, 감독 이력과 문서, 모의점검, 재적발 위험 관리</p></a>';
+    if (can("library","read")) html += '<a class="hc" href="#/library"><div class="ic">📚</div><h3>자료실</h3><p>참고자료 01~12와 매뉴얼 원본</p></a>';
+    html += '</div></div>';
+    el.innerHTML = html;
+  }
+
+  /* =====================================================================
+     대응 매뉴얼 (본문은 DB manual_pages)
+     ===================================================================== */
+  var MANUAL = null; // [{id,grp,grp_sort,sort,title,lead,body_html,refs,updated_at,updated_by}]
+  var manualEditing = false;
+  var manualOpenGroups = {};
+  async function loadManual(force){
+    if (MANUAL && !force) return MANUAL;
+    var r = await sb.from("manual_pages").select("*").order("grp_sort").order("sort");
+    MANUAL = r.data || [];
+    return MANUAL;
+  }
+  async function getManualPage(id){
+    try { await loadManual(); } catch(e){ return null; }
+    return (MANUAL||[]).filter(function(p){ return p.id === id; })[0] || null;
+  }
+  function manualGroups(){
+    var groups = [], map = {};
+    (MANUAL||[]).forEach(function(p){ if (!map[p.grp]){ map[p.grp] = { name:p.grp, items:[] }; groups.push(map[p.grp]); } map[p.grp].items.push(p); });
+    return groups;
+  }
+  function manualSidebar(){
+    if (!MANUAL) return '<div class="side-title">MANUAL</div><div class="side-sec">대응 매뉴얼</div><div class="empty-row" style="padding:0 10px">불러오는 중…</div>';
+    var html = '<div class="side-title">MANUAL</div><div class="side-sec">근로감독 대응 매뉴얼</div>';
+    manualGroups().forEach(function(g, gi){
+      var has = g.items.some(function(p){ return p.id === currentManualId; });
+      if (has) manualOpenGroups[g.name] = true;
+      var open = !!manualOpenGroups[g.name];
+      html += '<div class="grp' + (open ? " open" : "") + '" data-grp="' + esc(g.name) + '"><button class="grp-h" type="button">' + esc(g.name) + '<span class="chev">▶</span></button><ul>' +
+        g.items.map(function(p){ return '<li><a href="#/manual/' + esc(p.id) + '"' + (p.id === currentManualId ? ' class="on"' : '') + '>' + esc(p.title) + '</a></li>'; }).join("") + '</ul></div>';
+    });
+    return html;
+  }
+  async function renderManual(){
+    var el = document.getElementById("view-manual");
+    if (!MANUAL){
+      el.innerHTML = '<div class="empty-row">매뉴얼을 불러오는 중…</div>';
+      try { await loadManual(); } catch(e){ el.innerHTML = '<div class="banner danger">매뉴얼을 불러오지 못했습니다.</div>'; return; }
+      if (!currentManualId && MANUAL.length) currentManualId = MANUAL[0].id;
+      return render();
+    }
+    if (!MANUAL.length){ el.innerHTML = '<div class="banner info">아직 등록된 매뉴얼 문서가 없습니다.</div>'; return; }
+    var page = MANUAL.filter(function(p){ return p.id === currentManualId; })[0];
+    if (!page){ currentManualId = MANUAL[0].id; return render(); }
+    var idx = MANUAL.indexOf(page), prev = MANUAL[idx-1], next = MANUAL[idx+1];
+    var canEdit = can("manual","edit");
+    var html = '<div class="doc-wrap"><article class="doc">';
+    html += '<div class="crumb"><a href="#/home">대시보드</a><span>›</span><a href="#/manual/' + esc(MANUAL[0].id) + '">대응 매뉴얼</a><span>›</span><span>' + esc(page.grp) + '</span></div>';
+    if (manualEditing && canEdit){
+      html += '<div class="doc-editor"><form class="f" id="manualEditForm">' +
+        '<label class="full">제목<input name="title" value="' + esc(page.title) + '"></label>' +
+        '<label class="full">요약<input name="lead" value="' + esc(page.lead||"") + '"></label>' +
+        '<label class="full">본문 (HTML)<textarea name="body_html">' + esc(page.body_html||"") + '</textarea></label>' +
+        '<label class="full">참고자료 번호 (쉼표로 구분, 예: 03,05)<input name="refs" value="' + esc((page.refs||[]).join(",")) + '"></label>' +
+        '<div class="form-actions"><button type="button" class="btn ghost sm" id="manualEditCancel">취소</button><button class="btn primary sm" type="submit">저장</button></div>' +
+      '</form></div>';
+    } else {
+      html += '<h1>' + esc(page.title) + '</h1>' + (page.lead ? '<p class="lead">' + esc(page.lead) + '</p>' : '');
+      html += '<div class="meta-line"><span class="tag b">대응 매뉴얼</span><span class="tag">' + esc(page.grp) + '</span>' +
+        (page.updated_at ? '<span class="tag">수정 ' + fmtDate(page.updated_at) + (page.updated_by ? ' · ' + esc(page.updated_by) : '') + '</span>' : '') +
+        (canEdit ? '<button class="btn sm" id="btnManualEdit" style="margin-left:auto">✎ 이 문서 수정</button>' : '') + '</div>';
+      html += '<div class="body">' + (page.body_html || "") + '</div>';
+      if ((page.refs||[]).length) html += '<div class="refs"><span class="lb">참고·활용 자료</span>' + page.refs.map(function(n){ return '<a href="#/library/' + esc(n) + '">[' + esc(n) + '] ' + esc(LIB_NAMES[n] || "자료") + '</a>'; }).join("") + '</div>';
+      html += '<nav class="pn">' + (prev ? '<a href="#/manual/' + esc(prev.id) + '"><small>← 이전 글</small><b>' + esc(prev.title) + '</b></a>' : '<span></span>') +
+        (next ? '<a class="nx" href="#/manual/' + esc(next.id) + '"><small>다음 글 →</small><b>' + esc(next.title) + '</b></a>' : '') + '</nav>';
+    }
+    html += '</article><nav class="toc-r" id="tocR"></nav></div>';
+    el.innerHTML = html;
+    wireDocLinks(el);
+    // sidebar group toggles
+    $all(".grp-h").forEach(function(b){ b.addEventListener("click", function(){ var g = b.parentNode; g.classList.toggle("open"); manualOpenGroups[g.getAttribute("data-grp")] = g.classList.contains("open"); }); });
+    var on = document.querySelector(".grp li a.on"), side = document.getElementById("side");
+    if (on && side) side.scrollTop = Math.max(0, on.offsetTop - 200);
+    buildRightToc(el);
+    var eb = document.getElementById("btnManualEdit");
+    if (eb) eb.addEventListener("click", function(){ manualEditing = true; renderManual(); });
+    var cf = document.getElementById("manualEditCancel");
+    if (cf) cf.addEventListener("click", function(){ manualEditing = false; renderManual(); });
+    var mf = document.getElementById("manualEditForm");
+    if (mf) mf.addEventListener("submit", async function(e){
+      e.preventDefault();
+      var fd = new FormData(mf);
+      var upd = { title: fd.get("title"), lead: fd.get("lead"), body_html: fd.get("body_html"),
+        refs: String(fd.get("refs")||"").split(",").map(function(s){ return s.trim(); }).filter(Boolean),
+        updated_at: new Date().toISOString(), updated_by: currentUser.email };
+      var r = await sb.from("manual_pages").update(upd).eq("id", page.id).select("id");
+      if (r.error || !r.data || !r.data.length){ alert("저장하지 못했습니다: " + ((r.error && r.error.message) || "권한이 없습니다.")); return; }
+      Object.assign(page, upd);
+      logAudit("manual", "edit", page.title);
+      manualEditing = false; toast("매뉴얼이 저장되었습니다."); render();
+    });
+    window.scrollTo(0,0);
+  }
+  function buildRightToc(root){
+    var host = document.getElementById("tocR"); if (!host) return;
+    var hs = Array.prototype.slice.call(root.querySelectorAll(".body h2"));
+    if (hs.length < 2){ host.innerHTML = ""; return; }
+    hs.forEach(function(h, i){ if (!h.id) h.id = "sec" + (i+1); });
+    host.innerHTML = '<h4>이 문서의 목차</h4>' + hs.map(function(h){ return '<a data-to="' + h.id + '">' + esc(h.textContent) + '</a>'; }).join("");
+    $all("a", host).forEach(function(a){ a.addEventListener("click", function(){ var t = document.getElementById(a.getAttribute("data-to")); if (t) t.scrollIntoView({behavior:"smooth", block:"start"}); }); });
+    var links = host.querySelectorAll("a");
+    window.onscroll = function(){ if (activeTab !== "manual") return; var y = window.scrollY + 120, cur = 0; hs.forEach(function(h, i){ if (h.offsetTop <= y) cur = i; }); Array.prototype.forEach.call(links, function(l, i){ l.classList.toggle("on", i === cur); }); };
+  }
+  // Links inside manual bodies: #/library/NN opens the library with that item highlighted,
+  // shared checklist boxes (data-ck) are informational only in the manual.
+  function wireDocLinks(root){
+    $all('input[data-ck]', root).forEach(function(cb){ cb.disabled = true; });
+  }
+
+  /* =====================================================================
+     감독 대응 (자료 취합)
+     ===================================================================== */
+  var respFilter = { team:"all", status:"all", mine:false };
+  function renderResponse(){
+    var el = document.getElementById("view-response");
+    if (!currentInspId) return renderResponseList(el);
+    var ins = LIVE.inspections.filter(function(x){ return x.id === currentInspId; })[0];
+    if (!ins){ currentInspId = ""; return renderResponseList(el); }
+    renderInspection(el, ins);
+  }
+  function renderResponseList(el){
+    var html = '<div class="page"><div class="panel-head" style="margin:0"><div><h2 style="font-size:22px;">감독 대응 (자료 취합)</h2><div class="desc">근로감독 통보를 받으면 감독 건을 만들고, 요청서류별 담당자를 지정해 자료를 모읍니다. 최종확정된 자료는 리스크 관리대장의 해당 감독 시기에 자동으로 연결됩니다.</div></div>' +
+      (can("response","manage") ? '<button class="btn primary" id="btnNewInsp">+ 새 근로감독 생성</button>' : '') + '</div>';
+    if (!LIVE.inspections.length) html += '<div class="panel"><div class="empty-row">등록된 근로감독이 없습니다.' + (can("response","manage") ? ' 감독 통보를 받으면 [새 근로감독 생성]을 눌러 시작하세요.' : '') + '</div></div>';
+    else {
+      html += '<div class="hc-grid">' + LIVE.inspections.map(function(x){
+        var its = itemsOf(x.id), fin = its.filter(function(i){ return i.status === "최종확정"; }).length, sub = its.filter(function(i){ return i.status === "제출"; }).length;
+        var pct = its.length ? Math.round(fin*100/its.length) : 0;
+        return '<a class="hc" href="#/response/' + x.id + '"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><h3>' + esc(x.title) + '</h3><span class="badge ' + (x.status === "종결" ? "neutral" : "info") + '">' + esc(x.status) + '</span></div>' +
+          '<p>' + esc(x.type||"") + (x.agency ? ' · ' + esc(x.agency) : '') + '</p><p>통보 ' + (x.notice_date ? fmtDate(x.notice_date) : "-") + ' · 감독일 ' + (x.visit_date ? fmtDate(x.visit_date) : "-") + '</p>' +
+          '<div class="progress"><span style="width:' + pct + '%"></span></div><p>최종확정 ' + fin + ' · 검토 대기 ' + sub + ' · 전체 ' + its.length + '</p></a>';
+      }).join("") + '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+    var nb = document.getElementById("btnNewInsp");
+    if (nb) nb.addEventListener("click", openNewInspModal);
+  }
+  function openNewInspModal(){
+    var y = new Date().getFullYear();
+    showModal('<h3>새 근로감독 생성</h3><p class="hint">기본 취합 목록(공식 요청서류 14 · 추가 요청 예상 9 · 감독 후 문서 5)이 자동으로 만들어지고, 리스크 관리대장에 같은 이름의 감독 시기가 자동 생성됩니다.</p>' +
+      '<form id="newInspForm">' +
+      '<label class="hint">연도</label><input name="year" type="number" value="' + y + '" required>' +
+      '<label class="hint">명칭 (비우면 "' + y + '년 근로감독")</label><input name="title" placeholder="' + y + '년 근로감독">' +
+      '<label class="hint">감독 종류</label><select name="type"><option>정기</option><option>수시</option><option>특별</option><option>재감독</option></select>' +
+      '<label class="hint">통보일</label><input name="notice" type="date" value="' + todayStr() + '">' +
+      '<label class="hint">감독(방문) 예정일</label><input name="visit" type="date">' +
+      '<label class="hint">감독기관</label><input name="agency" placeholder="예: 서울관악지청">' +
+      '<div class="modal-actions"><button type="button" class="btn ghost" id="niCancel">취소</button><button class="btn primary" type="submit">생성</button></div></form>', true);
+    document.getElementById("niCancel").addEventListener("click", closeModal);
+    document.getElementById("newInspForm").addEventListener("submit", async function(e){
+      e.preventDefault();
+      var fd = new FormData(e.target);
+      var r = await sb.rpc("create_inspection", { p_year: Number(fd.get("year")), p_type: fd.get("type"), p_notice: fd.get("notice") || null, p_visit: fd.get("visit") || null, p_agency: fd.get("agency") || "", p_title: fd.get("title") || null });
+      if (r.error){ alert("생성하지 못했습니다: " + r.error.message); return; }
+      closeModal();
+      await loadLive(); await loadStateFromServer();
+      currentInspId = r.data; toast("근로감독이 생성되었습니다. 관리대장에도 감독 시기가 추가되었습니다."); render();
+    });
+  }
+  function renderInspection(el, ins){
+    var me = String(currentUser.email||"").toLowerCase();
+    var all = itemsOf(ins.id);
+    var teams = all.map(function(i){ return i.owner_team || "-"; }).filter(function(v, i, a){ return a.indexOf(v) === i; });
+    var list = all.filter(function(i){
+      if (respFilter.team !== "all" && (i.owner_team || "-") !== respFilter.team) return false;
+      if (respFilter.status !== "all" && i.status !== respFilter.status) return false;
+      if (respFilter.mine && (i.assignee_email||"").toLowerCase() !== me) return false;
+      return true;
+    });
+    var cnt = function(s){ return all.filter(function(i){ return i.status === s; }).length; };
+    var canEditItems = can("response","edit"), canManage = can("response","manage");
+    var html = '<div class="page">';
+    html += '<div class="crumb" style="font-size:12.5px;color:var(--ink-300);margin-bottom:8px"><a href="#/response" style="color:var(--ink-500);text-decoration:none">감독 대응</a> › ' + esc(ins.title) + '</div>';
+    html += '<div class="panel-head" style="margin:0"><div><h2 style="font-size:22px;">' + esc(ins.title) + ' <span class="badge info" style="vertical-align:middle">' + esc(ins.status) + '</span></h2>' +
+      '<div class="desc">' + esc(ins.type||"") + '감독' + (ins.agency ? ' · ' + esc(ins.agency) : '') + ' · 통보 ' + (ins.notice_date ? fmtDate(ins.notice_date) : "-") + ' · 감독일 ' + (ins.visit_date ? fmtDate(ins.visit_date) : "-") +
+      (ins.ledger_round_id && canLedgerAny("read") ? ' · <a href="#/ledger/inspections" id="goLedgerRound">관리대장에서 보기 →</a>' : '') + '</div></div>' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">' + (canEditItems ? '<button class="btn sm" id="btnEditInsp">감독 정보 수정</button><button class="btn sm" id="btnAddItem">+ 항목 추가</button>' : '') +
+      (canManage ? '<button class="btn sm danger" id="btnDelInsp">삭제</button>' : '') + '</div></div>';
+    html += '<div class="grid-stats" style="margin-top:14px">' +
+      statCard("전체 항목", String(all.length) + '<small>건</small>', "") +
+      statCard("요청 (미제출)", String(cnt("요청")) + '<small>건</small>', "담당자 업로드 대기") +
+      statCard("검토 대기", String(cnt("제출")) + '<small>건</small>', "노무관리파트 검토") +
+      statCard("반려", String(cnt("반려")) + '<small>건</small>', "재제출 필요", cnt("반려") > 0) +
+      statCard("최종확정", String(cnt("최종확정")) + '<small>건</small>', "관리대장 자동 연계") + '</div>';
+    html += '<div class="panel" style="padding:12px 16px;display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">' +
+      filterSelect("담당 팀", "rfTeam", respFilter.team, [["all","전체"]].concat(teams.map(function(t){ return [t,t]; }))) +
+      filterSelect("상태", "rfStatus", respFilter.status, [["all","전체"],["요청","요청"],["제출","제출(검토 대기)"],["반려","반려"],["최종확정","최종확정"]]) +
+      '<label style="display:flex;gap:6px;align-items:center;font-size:13px;font-weight:600;color:var(--ink-700)"><input type="checkbox" id="rfMine"' + (respFilter.mine ? " checked" : "") + '> 내 항목만</label>' +
+      '<span class="badge neutral">' + list.length + ' / ' + all.length + '건</span></div>';
+    var cats = list.map(function(i){ return i.category || "기타"; }).filter(function(v, i, a){ return a.indexOf(v) === i; });
+    cats.forEach(function(cat){
+      var rows = list.filter(function(i){ return (i.category || "기타") === cat; });
+      html += '<div class="panel"><div class="panel-head"><h2>' + esc(cat) + ' <span class="badge neutral">' + rows.length + '</span></h2></div><div class="scrollx"><table class="tbl"><thead><tr><th>No</th><th>자료</th><th>담당</th><th>마감</th><th>상태</th><th>제출 파일</th><th></th></tr></thead><tbody>' +
+        rows.map(function(i){
+          var fs = filesOf(i.id), fin = finalOf(i.id), last = fs[fs.length-1];
+          var mineItem = (i.assignee_email||"").toLowerCase() === me;
+          var canUp = canEditItems || (can("response","write") && mineItem);
+          var assignCell = canEditItems
+            ? '<select data-assign="' + i.id + '"><option value="">(미지정)</option>' + LIVE.users.map(function(u){ return '<option value="' + esc(u.email) + '"' + (u.email === (i.assignee_email||"").toLowerCase() ? " selected" : "") + '>' + esc(u.name || u.email) + (u.team ? " · " + esc(u.team) : "") + '</option>'; }).join("") + '</select><div class="hint" style="font-size:11.5px">' + esc(i.owner_team||"") + '</div>'
+            : esc(userLabel(i.assignee_email)) + '<div class="hint" style="font-size:11.5px">' + esc(i.owner_team||"") + '</div>';
+          var dueCell = canEditItems ? '<input type="date" data-due="' + i.id + '" value="' + esc(i.due_date||"") + '">' : (i.due_date ? fmtDate(i.due_date) : "-");
+          var filesCell = !fs.length ? '<span class="hint">-</span>' :
+            (fin ? '<div>✅ ' + fileLink(fin) + ' <span class="badge good">최종 v' + fin.version + '</span></div>' : '') +
+            (last && (!fin || last.id !== fin.id) ? '<div>' + fileLink(last) + ' <span class="badge neutral">v' + last.version + '</span>' + (canManage ? ' <button class="btn sm" data-final="' + last.id + '">최종 확정</button>' : '') + '</div>' : '') +
+            (fs.length > 1 ? '<details style="margin-top:4px"><summary class="hint" style="cursor:pointer;font-size:12px">이전 버전 ' + (fs.length) + '개</summary>' + fs.map(function(f){ return '<div style="font-size:12px">v' + f.version + ' · ' + fileLink(f) + ' · ' + esc(userLabel(f.uploaded_by)) + ' · ' + fmtDate(f.uploaded_at) + (f.comment ? ' · ' + esc(f.comment) : '') + (canManage && !f.is_final ? ' <button class="btn sm" data-final="' + f.id + '">이 버전 확정</button>' : '') + '</div>'; }).join("") + '</details>' : '');
+          return '<tr><td class="mono">' + esc(i.no||"") + '</td><td><b>' + esc(i.title) + '</b><div class="hint" style="font-size:12px">' + esc([i.period, i.form].filter(Boolean).join(" · ")) + ' · 관리대장 구분: ' + esc(i.ledger_kind) + '</div>' +
+              (i.note ? '<div style="font-size:12px;margin-top:2px">💬 ' + esc(i.note) + '</div>' : '') + (i.reject_reason ? '<div style="font-size:12px;color:var(--danger-700)">반려: ' + esc(i.reject_reason) + '</div>' : '') + '</td>' +
+            '<td>' + assignCell + '</td><td>' + dueCell + '</td><td>' + statusBadge(i.status) + '</td><td style="min-width:220px">' + filesCell + '</td>' +
+            '<td style="white-space:nowrap">' + (canUp ? '<button class="btn sm primary" data-upload="' + i.id + '">업로드</button> ' : '') +
+              (canUp ? '<button class="btn sm" data-note="' + i.id + '">메모</button> ' : '') +
+              (canManage && i.status === "제출" ? '<button class="btn sm danger" data-reject="' + i.id + '">반려</button> ' : '') +
+              (canEditItems ? '<button class="btn sm ghost" data-del-item="' + i.id + '">삭제</button>' : '') + '</td></tr>';
+        }).join("") + '</tbody></table></div></div>';
+    });
+    // 별표2 checklist (shared per inspection)
+    html += '<div class="panel"><div class="panel-head"><div><h2>감독 시 확인 서류 체크리스트 (별표2)</h2><div class="desc">근로감독관이 법 분야별로 확인하는 서류입니다. 체크 상태는 이 감독 건에 저장되어 담당자 모두가 함께 봅니다.</div></div></div>' +
+      GUIDE_CHECKLIST.map(function(cat){
+        var done = cat.items.filter(function(it, idx){ return (ins.checklist||{})["g" + cat.no + "-" + idx]; }).length;
+        return '<details class="subcat"><summary>' + cat.no + '. ' + esc(cat.title) + ' <span class="badge ' + (done === cat.items.length ? "good" : "neutral") + '">' + done + ' / ' + cat.items.length + '</span></summary><div class="subcat-body"><div class="checklist-grid">' +
+          cat.items.map(function(it, idx){ var key = "g" + cat.no + "-" + idx; var on = !!(ins.checklist||{})[key];
+            return '<div class="ci"><input type="checkbox" id="ck-' + key + '" data-check="' + key + '"' + (on ? " checked" : "") + (can("response","write") ? "" : " disabled") + '><label for="ck-' + key + '">' + esc(it) + '</label></div>'; }).join("") +
+          '</div></div></details>';
+      }).join("") + '</div>';
+    html += '</div>';
+    el.innerHTML = html;
+
+    var g = document.getElementById("goLedgerRound");
+    if (g) g.addEventListener("click", function(e){ e.preventDefault(); selectedRoundId = ins.ledger_round_id; inspectionViewMode = "byRound"; activeTab = "inspections"; saveUiState(); render(); });
+    ["rfTeam","rfStatus"].forEach(function(id){ var s = document.getElementById(id); if (s) s.addEventListener("change", function(){ respFilter[id === "rfTeam" ? "team" : "status"] = s.value; renderResponse(); }); });
+    var m = document.getElementById("rfMine"); if (m) m.addEventListener("change", function(){ respFilter.mine = m.checked; renderResponse(); });
+    $all("[data-upload]", el).forEach(function(b){ b.addEventListener("click", function(){ openUploadModal(ins, b.getAttribute("data-upload")); }); });
+    $all("[data-final]", el).forEach(function(b){ b.addEventListener("click", async function(){
+      if (!confirm("이 파일을 최종본으로 확정할까요? 확정본은 관리대장 감독 시기에 자동으로 표시됩니다.")) return;
+      var r = await sb.rpc("finalize_file", { p_file: b.getAttribute("data-final") });
+      if (r.error){ alert(r.error.message); return; }
+      await loadLive(); toast("최종본으로 확정되었습니다."); renderResponse(); }); });
+    $all("[data-reject]", el).forEach(function(b){ b.addEventListener("click", async function(){
+      var reason = prompt("반려 사유를 입력하세요 (담당자에게 표시됩니다)");
+      if (reason === null) return;
+      var r = await sb.rpc("reject_item", { p_item: b.getAttribute("data-reject"), p_reason: reason });
+      if (r.error){ alert(r.error.message); return; }
+      await loadLive(); renderResponse(); }); });
+    $all("[data-note]", el).forEach(function(b){ b.addEventListener("click", async function(){
+      var it = LIVE.items.filter(function(x){ return x.id === b.getAttribute("data-note"); })[0];
+      var v = prompt("메모 (진행 상황, 특이사항)", (it && it.note) || "");
+      if (v === null) return;
+      var r = await sb.rpc("set_item_note", { p_item: it.id, p_note: v });
+      if (r.error){ alert(r.error.message); return; }
+      await loadLive(); renderResponse(); }); });
+    $all("[data-assign]", el).forEach(function(s){ s.addEventListener("change", async function(){
+      var r = await sb.from("collect_items").update({ assignee_email: s.value || null, updated_at: new Date().toISOString() }).eq("id", s.getAttribute("data-assign"));
+      if (r.error){ alert(r.error.message); return; } await loadLive(); toast("담당자가 지정되었습니다."); }); });
+    $all("[data-due]", el).forEach(function(s){ s.addEventListener("change", async function(){
+      var r = await sb.from("collect_items").update({ due_date: s.value || null }).eq("id", s.getAttribute("data-due"));
+      if (r.error){ alert(r.error.message); return; } await loadLive(); }); });
+    $all("[data-del-item]", el).forEach(function(b){ b.addEventListener("click", function(){
+      confirmModal("이 항목과 업로드된 파일 기록을 삭제할까요?", async function(){
+        var r = await sb.from("collect_items").delete().eq("id", b.getAttribute("data-del-item"));
+        if (r.error){ alert(r.error.message); return; } await loadLive(); renderResponse(); }); }); });
+    $all("[data-check]", el).forEach(function(cb){ cb.addEventListener("change", async function(){
+      var r = await sb.rpc("set_check", { p_insp: ins.id, p_key: cb.getAttribute("data-check"), p_val: cb.checked });
+      if (r.error){ alert(r.error.message); cb.checked = !cb.checked; return; }
+      ins.checklist = ins.checklist || {}; ins.checklist[cb.getAttribute("data-check")] = cb.checked; }); });
+    var ai = document.getElementById("btnAddItem");
+    if (ai) ai.addEventListener("click", function(){
+      showModal('<h3>항목 추가</h3><form id="addItemForm">' +
+        '<label class="hint">구분</label><select name="category"><option>공식 요청서류</option><option>추가 요청 예상</option><option>현장 추가 요청</option><option>감독 후 문서</option></select>' +
+        '<label class="hint">자료명</label><input name="title" required>' +
+        '<label class="hint">대상 기간</label><input name="period">' +
+        '<label class="hint">담당 팀</label><input name="owner_team" placeholder="HRM팀 / HRBP팀 / 채용팀 / HRM팀 노무관리파트">' +
+        '<label class="hint">관리대장 구분</label><select name="ledger_kind"><option>제출자료</option><option>시정지시서/명령서</option><option>보고자료(내부용)</option><option>보고자료(노동부)</option><option>기타</option></select>' +
+        '<div class="modal-actions"><button type="button" class="btn ghost" id="aiCancel">취소</button><button class="btn primary" type="submit">추가</button></div></form>', true);
+      document.getElementById("aiCancel").addEventListener("click", closeModal);
+      document.getElementById("addItemForm").addEventListener("submit", async function(e){
+        e.preventDefault(); var fd = new FormData(e.target);
+        var r = await sb.from("collect_items").insert({ inspection_id: ins.id, sort: 100 + all.length, no: "N-" + (all.length+1), category: fd.get("category"), title: fd.get("title"), period: fd.get("period"), owner_team: fd.get("owner_team"), ledger_kind: fd.get("ledger_kind") });
+        if (r.error){ alert(r.error.message); return; } closeModal(); await loadLive(); renderResponse(); });
+    });
+    var ei = document.getElementById("btnEditInsp");
+    if (ei) ei.addEventListener("click", function(){
+      showModal('<h3>감독 정보 수정</h3><form id="editInspForm">' +
+        '<label class="hint">명칭</label><input name="title" value="' + esc(ins.title) + '">' +
+        '<label class="hint">상태</label><select name="status">' + ["준비중","감독완료","시정이행","종결"].map(function(s){ return '<option' + (s === ins.status ? " selected" : "") + '>' + s + '</option>'; }).join("") + '</select>' +
+        '<label class="hint">통보일</label><input type="date" name="notice_date" value="' + esc(ins.notice_date||"") + '">' +
+        '<label class="hint">감독일</label><input type="date" name="visit_date" value="' + esc(ins.visit_date||"") + '">' +
+        '<label class="hint">감독기관</label><input name="agency" value="' + esc(ins.agency||"") + '">' +
+        '<div class="modal-actions"><button type="button" class="btn ghost" id="eiCancel">취소</button><button class="btn primary" type="submit">저장</button></div></form>', true);
+      document.getElementById("eiCancel").addEventListener("click", closeModal);
+      document.getElementById("editInspForm").addEventListener("submit", async function(e){
+        e.preventDefault(); var fd = new FormData(e.target);
+        var r = await sb.from("inspections_live").update({ title: fd.get("title"), status: fd.get("status"), notice_date: fd.get("notice_date") || null, visit_date: fd.get("visit_date") || null, agency: fd.get("agency") }).eq("id", ins.id);
+        if (r.error){ alert(r.error.message); return; } closeModal(); await loadLive(); renderResponse(); });
+    });
+    var di = document.getElementById("btnDelInsp");
+    if (di) di.addEventListener("click", function(){
+      confirmModal("이 근로감독 건과 취합 목록·업로드 기록을 삭제할까요? (관리대장의 감독 시기는 남습니다)", async function(){
+        var r = await sb.from("inspections_live").delete().eq("id", ins.id);
+        if (r.error){ alert(r.error.message); return; } currentInspId = ""; await loadLive(); render(); });
+    });
+  }
+  function openUploadModal(ins, itemId){
+    var it = LIVE.items.filter(function(x){ return x.id === itemId; })[0];
+    showModal('<h3>자료 업로드</h3><p class="hint">' + esc(it.title) + '</p>' +
+      '<form id="upForm"><input type="file" name="file" required><label class="hint">코멘트 (선택)</label><input name="comment" placeholder="예: 2025.9~2026.8 기준, 개인정보 마스킹 완료">' +
+      '<p class="hint" style="font-size:12px">파일명은 매뉴얼 자료번호 체계를 권장합니다 (예: [' + esc(it.no||"") + '] ' + esc(it.title).slice(0,20) + '). 요청 외 개인정보는 마스킹 후 올려주세요.</p>' +
+      '<div class="modal-actions"><button type="button" class="btn ghost" id="upCancel">취소</button><button class="btn primary" type="submit" id="upBtn">업로드</button></div></form>', true);
+    document.getElementById("upCancel").addEventListener("click", closeModal);
+    document.getElementById("upForm").addEventListener("submit", async function(e){
+      e.preventDefault();
+      var f = e.target.file.files[0]; if (!f) return;
+      var btn = document.getElementById("upBtn"); btn.disabled = true; btn.textContent = "업로드 중…";
+      var up = await uploadOneFile(f, "response/" + ins.id + "/" + itemId);
+      if (!up.ok){ alert(up.message); btn.disabled = false; btn.textContent = "업로드"; return; }
+      var r = await sb.rpc("submit_file", { p_item: itemId, p_path: up.meta.path, p_name: f.name, p_size: f.size, p_type: f.type || "", p_comment: e.target.comment.value || "" });
+      if (r.error){ alert(r.error.message); btn.disabled = false; btn.textContent = "업로드"; return; }
+      closeModal(); await loadLive(); toast("업로드되었습니다. 노무관리파트 검토 후 최종 확정됩니다."); renderResponse();
+    });
+  }
+
+  // Final files shown inside the ledger's 감독 시기 view (auto-link, no copies)
+  function renderLiveFinalsForRound(round){
+    var ins = LIVE.inspections.filter(function(x){ return x.ledger_round_id === round.id || x.id === round.liveInspectionId; })[0];
+    if (!ins){
+      if (round.liveInspectionId && !can("response","read")) return '<div class="banner info">이 감독 시기는 감독 대응(자료 취합)과 연결되어 있습니다. 최종본을 보려면 감독 대응 읽기 권한이 필요합니다.</div>';
+      return "";
+    }
+    var items = itemsOf(ins.id).filter(function(i){ return finalOf(i.id); });
+    var total = itemsOf(ins.id).length;
+    var html = '<div class="panel"><div class="panel-head"><div><h2 style="font-size:15px;">감독 대응 최종본 (자동 연계)</h2><div class="desc">감독 대응 › ' + esc(ins.title) + '에서 최종 확정된 자료입니다 (' + items.length + ' / ' + total + '건). 원본은 감독 대응 화면에서 관리됩니다.</div></div>' +
+      '<a class="btn sm" href="#/response/' + ins.id + '">감독 대응에서 보기 →</a></div>';
+    if (!items.length) html += '<div class="empty-row">아직 최종 확정된 자료가 없습니다.</div>';
+    else html += '<div class="scrollx"><table class="tbl"><thead><tr><th>구분</th><th>자료명</th><th>최종본</th><th>확정일</th><th>제출</th></tr></thead><tbody>' +
+      items.map(function(i){ var f = finalOf(i.id); return '<tr><td>' + esc(i.ledger_kind) + '</td><td>' + esc(i.title) + '</td><td>' + fileLink(f) + '</td><td class="mono">' + fmtDate(i.updated_at) + '</td><td>' + esc(userLabel(f.uploaded_by)) + '</td></tr>'; }).join("") +
+      '</tbody></table></div>';
+    return html + '</div>';
+  }
+
+  /* =====================================================================
+     자료실
+     ===================================================================== */
+  var LIB_NAMES = { "01":"감독 종류 비교","02":"준비서류 안내문","03":"준비서류 분장표","04":"점검 주요 서류(별표2)","05":"노무관리 진단표","06":"감독점검표(별지11)","07":"조치기준(별표3)","08":"과태료 부과기준","09":"2025.9 감독 결과","10":"모의근로감독 결과","11":"계열사 감독 이력","12":"매뉴얼 원본" };
+  var LIB = null;
+  async function renderLibrary(){
+    var el = document.getElementById("view-library");
+    if (!LIB){ el.innerHTML = '<div class="empty-row">불러오는 중…</div>'; var r = await sb.from("library_items").select("*").order("no").order("sort"); LIB = r.data || []; }
+    var canW = can("library","write"), canE = can("library","edit"), canM = can("library","manage");
+    var html = '<div class="page"><div class="panel-head" style="margin:0"><div><h2 style="font-size:22px;">자료실</h2><div class="desc">매뉴얼에서 참고하는 자료(01~12)를 웹에 보관합니다. 매뉴얼 각 문서 하단의 [번호]를 누르면 이곳으로 연결됩니다.</div></div>' +
+      (canW ? '<button class="btn primary" id="btnLibUp">+ 자료 올리기</button>' : '') + '</div>';
+    html += '<div class="panel"><div class="scrollx"><table class="tbl"><thead><tr><th>No</th><th>자료</th><th>파일</th><th>크기</th><th>열람 범위</th><th>등록</th>' + (canE ? '<th></th>' : '') + '</tr></thead><tbody>';
+    if (!LIB.length) html += '<tr><td colspan="7" class="empty-row">등록된 자료가 없습니다.</td></tr>';
+    LIB.forEach(function(x){
+      var hl = libraryFocus && x.no === libraryFocus;
+      html += '<tr id="lib-' + esc(x.no||x.id) + '"' + (hl ? ' class="flash-highlight"' : '') + '><td class="mono"><b>' + esc(x.no||"") + '</b></td><td>' + esc(x.title) + (x.note ? '<div class="hint" style="font-size:12px">' + esc(x.note) + '</div>' : '') + '</td>' +
+        '<td>' + (x.storage_path ? '<a href="#" data-storage-path="' + esc(x.storage_path) + '">📎 ' + esc(x.file_name||"파일") + '</a> <a href="#" data-storage-download-path="' + esc(x.storage_path) + '" data-storage-download-name="' + esc(x.file_name||"") + '" style="font-size:11px">다운로드</a>' : (x.url ? '<a href="' + esc(x.url) + '" target="_blank" rel="noopener">열기 ↗</a>' : '-')) + '</td>' +
+        '<td class="mono">' + humanSize(x.size) + '</td>' +
+        '<td>' + (canM ? '<select data-minlvl="' + x.id + '">' + ["read","write","edit","manage"].map(function(l){ return '<option value="' + l + '"' + (l === x.min_level ? " selected" : "") + '>' + LEVEL_LABEL[l] + ' 이상</option>'; }).join("") + '</select>' : '<span class="badge neutral">' + LEVEL_LABEL[x.min_level] + ' 이상</span>') + '</td>' +
+        '<td class="mono">' + fmtDate(x.uploaded_at) + '</td>' + (canE ? '<td><button class="btn sm danger" data-del-lib="' + x.id + '">삭제</button></td>' : '') + '</tr>';
+    });
+    html += '</tbody></table></div></div></div>';
+    el.innerHTML = html;
+    if (libraryFocus){ var t = document.getElementById("lib-" + libraryFocus); if (t) t.scrollIntoView({ block:"center" }); }
+    var ub = document.getElementById("btnLibUp");
+    if (ub) ub.addEventListener("click", function(){
+      showModal('<h3>자료 올리기</h3><form id="libForm"><label class="hint">번호 (예: 03)</label><input name="no" placeholder="03">' +
+        '<label class="hint">자료명</label><input name="title" required><label class="hint">설명 (선택)</label><input name="note">' +
+        '<label class="hint">열람 범위</label><select name="min_level"><option value="read">읽기 이상</option><option value="write">쓰기 이상</option><option value="edit">편집 이상</option><option value="manage">관리만</option></select>' +
+        '<input type="file" name="file" required><div class="modal-actions"><button type="button" class="btn ghost" id="lbCancel">취소</button><button class="btn primary" type="submit" id="lbBtn">올리기</button></div></form>', true);
+      document.getElementById("lbCancel").addEventListener("click", closeModal);
+      document.getElementById("libForm").addEventListener("submit", async function(e){
+        e.preventDefault(); var fd = new FormData(e.target); var f = e.target.file.files[0]; if (!f) return;
+        var btn = document.getElementById("lbBtn"); btn.disabled = true; btn.textContent = "업로드 중…";
+        var up = await uploadOneFile(f, "library");
+        if (!up.ok){ alert(up.message); btn.disabled = false; btn.textContent = "올리기"; return; }
+        var r = await sb.from("library_items").insert({ no: fd.get("no"), title: fd.get("title"), note: fd.get("note"), min_level: fd.get("min_level"), file_name: f.name, storage_path: up.meta.path, size: f.size });
+        if (r.error){ alert(r.error.message); btn.disabled = false; return; }
+        logAudit("library", "upload", f.name); closeModal(); LIB = null; renderLibrary();
+      });
+    });
+    $all("[data-minlvl]", el).forEach(function(s){ s.addEventListener("change", async function(){
+      var r = await sb.from("library_items").update({ min_level: s.value }).eq("id", s.getAttribute("data-minlvl"));
+      if (r.error) alert(r.error.message); else toast("열람 범위가 변경되었습니다."); }); });
+    $all("[data-del-lib]", el).forEach(function(b){ b.addEventListener("click", function(){
+      confirmModal("이 자료를 삭제할까요?", async function(){
+        var x = LIB.filter(function(i){ return i.id === b.getAttribute("data-del-lib"); })[0];
+        if (x && x.storage_path) await sb.storage.from(STORAGE_BUCKET).remove([x.storage_path]);
+        var r = await sb.from("library_items").delete().eq("id", x.id);
+        if (r.error){ alert(r.error.message); return; } LIB = null; renderLibrary(); }); }); });
+  }
+
+  /* =====================================================================
+     관리 (사용자·권한 / 기본 설정 / 변경 이력 / 데이터 가져오기)
+     ===================================================================== */
+  var PRESETS = {
+    "관리자": { admin:"manage", manual:"manage", response:"manage", library:"manage", ledger_findings:"manage", ledger_rounds:"manage", ledger_selfcheck:"manage" },
+    "노무관리파트 담당": { manual:"edit", response:"manage", library:"edit", ledger_findings:"edit", ledger_rounds:"edit", ledger_selfcheck:"edit" },
+    "자료 제출 담당 (HRM·HRBP·채용)": { manual:"read", response:"write", library:"read", ledger_findings:"none", ledger_rounds:"none", ledger_selfcheck:"none" },
+    "경영진 열람": { manual:"read", response:"read", library:"read", ledger_findings:"read", ledger_rounds:"read", ledger_selfcheck:"read" },
+    "매뉴얼만 열람": { manual:"read" }
+  };
+  async function renderAdmin(){
+    var el = document.getElementById("view-admin");
+    el.innerHTML = '<div class="empty-row">불러오는 중…</div>';
+    var u = await sb.from("user_permissions").select("*").order("team").order("name");
+    var logs = await sb.from("audit_log").select("*").order("at", { ascending:false }).limit(60);
+    var users = u.data || [];
+    var html = '<div class="page"><div class="panel-head" style="margin:0"><div><h2 style="font-size:22px;">관리</h2><div class="desc">사용자별 메뉴 권한, 기본 설정, 변경 이력을 관리합니다.</div></div></div>';
+    html += '<div class="panel"><div class="panel-head"><div><h2>사용자·권한</h2><div class="desc">없음 · 읽기(조회) · 쓰기(등록·업로드) · 편집(남의 기록 수정·삭제) · 관리(최종본 확정·감독 생성·권한 부여). 권한은 서버(RLS)에서 강제됩니다.</div></div><button class="btn primary sm" id="btnAddUser">+ 사용자 추가</button></div>';
+    html += '<div class="scrollx"><table class="tbl"><thead><tr><th>이메일</th><th>이름</th><th>팀</th>' + MENUS.map(function(m){ return '<th>' + esc(m.label) + '</th>'; }).join("") + '<th></th></tr></thead><tbody>' +
+      users.map(function(x){
+        return '<tr data-user="' + esc(x.email) + '"><td class="mono" style="font-size:12px">' + esc(x.email) + '</td><td><input data-f="name" value="' + esc(x.name||"") + '" style="width:90px"></td><td><input data-f="team" value="' + esc(x.team||"") + '" style="width:120px"></td>' +
+          MENUS.map(function(m){ var cur = (x.perms||{})[m.key] || "none";
+            var opts = (m.key === "admin" ? ["none","manage"] : LEVELS);
+            return '<td><select data-perm="' + m.key + '">' + opts.map(function(l){ return '<option value="' + l + '"' + (l === cur ? " selected" : "") + '>' + LEVEL_LABEL[l] + '</option>'; }).join("") + '</select></td>'; }).join("") +
+          '<td style="white-space:nowrap"><button class="btn sm primary" data-save-user="' + esc(x.email) + '">저장</button> <button class="btn sm danger" data-del-user="' + esc(x.email) + '">삭제</button></td></tr>';
+      }).join("") + '</tbody></table></div>';
+    html += '<div class="banner info" style="margin-top:12px">로그인 계정 만들기: Supabase 대시보드 › Authentication › Users › <b>Add user</b> (Create new user 또는 Send invitation). 같은 이메일로 여기 권한을 등록하면 로그인 후 해당 메뉴가 보입니다.</div></div>';
+
+    html += '<div class="panel" id="settingsPanel"></div>';
+
+    html += '<div class="panel"><div class="panel-head"><div><h2>변경 이력</h2><div class="desc">권한 변경, 최종본 확정, 저장, 업로드 기록 (최근 60건)</div></div></div><ul class="changelog">' +
+      (logs.data || []).map(function(c){ return '<li><time>' + esc(String(c.at).slice(0,16).replace("T"," ")) + '</time><span>' + esc(c.email) + ' — [' + esc(c.menu||"") + '] ' + esc(c.action||"") + ' ' + esc(c.detail||"") + '</span></li>'; }).join("") + '</ul></div>';
+
+    html += '<div class="panel"><div class="panel-head"><div><h2>기존 관리대장 데이터 가져오기</h2><div class="desc">이전 관리대장(별도 Supabase 프로젝트)의 적발 사항·감독 이력·모의점검·첨부파일을 이 대시보드로 복사합니다. 한 번만 실행하세요. 기존 프로젝트의 데이터는 지워지지 않습니다.</div></div></div>' +
+      '<form class="f" id="migForm"><label>기존 관리대장 로그인 이메일<input name="email" type="email" required autocomplete="off"></label><label>기존 관리대장 비밀번호<input name="pw" type="password" required autocomplete="off"></label>' +
+      '<div class="form-actions"><button class="btn primary sm" type="submit" id="migBtn">가져오기 실행</button></div></form><div class="log" id="migLog" style="display:none;margin-top:10px"></div></div>';
+    html += '</div>';
+    el.innerHTML = html;
+
+    // settings (reuse the ledger settings form, without the old changelog/password blocks)
+    renderSettingsInto(document.getElementById("settingsPanel"));
+
+    $all("[data-save-user]", el).forEach(function(b){ b.addEventListener("click", async function(){
+      var tr = b.closest("tr"); var perms = {};
+      $all("[data-perm]", tr).forEach(function(s){ if (s.value !== "none") perms[s.getAttribute("data-perm")] = s.value; });
+      var r = await sb.from("user_permissions").update({ name: tr.querySelector('[data-f="name"]').value, team: tr.querySelector('[data-f="team"]').value, perms: perms, updated_at: new Date().toISOString() }).eq("email", b.getAttribute("data-save-user"));
+      if (r.error){ alert(r.error.message); return; }
+      logAudit("admin", "permissions", b.getAttribute("data-save-user") + " " + JSON.stringify(perms)); toast("권한이 저장되었습니다."); }); });
+    $all("[data-del-user]", el).forEach(function(b){ b.addEventListener("click", function(){
+      var em = b.getAttribute("data-del-user");
+      if (em === String(currentUser.email).toLowerCase()){ alert("본인 계정의 권한은 삭제할 수 없습니다."); return; }
+      confirmModal(em + " 의 대시보드 권한을 모두 삭제할까요? (로그인 계정 자체는 Supabase에서 따로 삭제)", async function(){
+        var r = await sb.from("user_permissions").delete().eq("email", em);
+        if (r.error){ alert(r.error.message); return; } logAudit("admin", "remove_user", em); renderAdmin(); }); }); });
+    document.getElementById("btnAddUser").addEventListener("click", function(){
+      showModal('<h3>사용자 추가</h3><form id="addUserForm"><label class="hint">이메일 (로그인 계정)</label><input name="email" type="email" required>' +
+        '<label class="hint">이름</label><input name="name"><label class="hint">팀</label><input name="team" placeholder="HRM팀 / HRBP팀 / 채용팀 / HRM팀 노무관리파트">' +
+        '<label class="hint">권한 묶음 (추가 후 표에서 메뉴별로 조정)</label><select name="preset">' + Object.keys(PRESETS).map(function(k){ return '<option>' + esc(k) + '</option>'; }).join("") + '</select>' +
+        '<div class="modal-actions"><button type="button" class="btn ghost" id="auCancel">취소</button><button class="btn primary" type="submit">추가</button></div></form>', true);
+      document.getElementById("auCancel").addEventListener("click", closeModal);
+      document.getElementById("addUserForm").addEventListener("submit", async function(e){
+        e.preventDefault(); var fd = new FormData(e.target);
+        var r = await sb.from("user_permissions").insert({ email: String(fd.get("email")).trim().toLowerCase(), name: fd.get("name"), team: fd.get("team"), perms: PRESETS[fd.get("preset")] });
+        if (r.error){ alert(r.error.message); return; } logAudit("admin", "add_user", fd.get("email")); closeModal(); await loadLive(); renderAdmin(); });
+    });
+    document.getElementById("migForm").addEventListener("submit", function(e){ e.preventDefault(); runMigration(new FormData(e.target)); });
+  }
+  function renderSettingsInto(host){
+    var html = '<div class="panel-head"><div><h2>기본 설정</h2><div class="desc">관리대장 계산 기준값</div></div></div>' +
+      '<form class="f" id="settingsForm">' +
+        field("회사/조직명", 'input', 'orgName', state.meta.orgName, 'text') +
+        field("기본 재적발 기준기간(년)", 'input', 'defaultRepeatWindowYears', state.meta.defaultRepeatWindowYears, 'number') +
+        field("모의점검 주기(개월)", 'input', 'selfCheckIntervalMonths', state.meta.selfCheckIntervalMonths, 'number') +
+        '<div class="form-actions"><button type="submit" class="btn primary sm">저장</button></div></form>' +
+      '<div class="panel-head" style="margin-top:20px"><div><h2>내 비밀번호 변경</h2></div></div>' +
+      '<form class="f" id="pwChangeForm"><input type="password" name="pw1" placeholder="새 비밀번호 (6자 이상)" required minlength="6" autocomplete="new-password"><input type="password" name="pw2" placeholder="새 비밀번호 확인" required minlength="6" autocomplete="new-password"><div class="form-actions"><button type="submit" class="btn sm">비밀번호 변경</button></div></form>';
+    host.innerHTML = html;
+    document.getElementById("settingsForm").addEventListener("submit", function(e){
+      e.preventDefault(); var fd = new FormData(e.target);
+      state.meta.title = TITLE;
+      state.meta.orgName = fd.get("orgName") || "";
+      state.meta.defaultRepeatWindowYears = Number(fd.get("defaultRepeatWindowYears")) || 3;
+      state.meta.selfCheckIntervalMonths = Number(fd.get("selfCheckIntervalMonths")) || 6;
+      commit("기본 설정 변경");
+    });
+    document.getElementById("pwChangeForm").addEventListener("submit", async function(e){
+      e.preventDefault(); var fd = new FormData(e.target);
+      if (fd.get("pw1") !== fd.get("pw2")){ alert("새 비밀번호 확인이 일치하지 않습니다."); return; }
+      var res = await sb.auth.updateUser({ password: fd.get("pw1") });
+      if (res.error){ alert("비밀번호 변경에 실패했습니다: " + res.error.message); return; }
+      e.target.reset(); toast("비밀번호가 변경되었습니다.");
+    });
+  }
+  // App settings are in the 관리 menu now; keep the old entry point harmless.
+  function renderSettings(){ activeTab = "admin"; render(); }
+
+  // One-time import from the previous standalone ledger project.
+  async function runMigration(fd){
+    var log = document.getElementById("migLog"), btn = document.getElementById("migBtn");
+    log.style.display = "block"; log.textContent = ""; btn.disabled = true;
+    function L(s){ log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; }
+    try {
+      var O = window.OLD_SUPABASE_CONFIG;
+      var old = window.supabase.createClient(O.url, O.anonKey, { auth: { persistSession:false, autoRefreshToken:false, storageKey:"old-ledger-import" } });
+      L("기존 관리대장 로그인 중…");
+      var s = await old.auth.signInWithPassword({ email: fd.get("email"), password: fd.get("pw") });
+      if (s.error) throw new Error("기존 관리대장 로그인 실패: " + s.error.message);
+      var r = await old.from("app_state").select("data").eq("id", "main").maybeSingle();
+      if (r.error || !r.data) throw new Error("기존 데이터를 읽지 못했습니다: " + ((r.error && r.error.message) || "데이터 없음"));
+      var src = r.data.data || {};
+      L("적발 사항 " + (src.inspections||[]).length + "건 · 감독 시기 " + (src.inspectionRounds||[]).length + "건 · 모의점검 " + (src.selfCheckRounds||[]).length + "회 · 카테고리 " + (src.categories||[]).length + "개");
+      // collect file paths referenced by the old data
+      var paths = [];
+      function addF(f){ if (f && f.path && paths.indexOf(f.path) < 0) paths.push(f.path); }
+      (src.inspectionRounds||[]).forEach(function(rd){ (rd.attachments||[]).forEach(addF); (rd.materials||[]).forEach(function(m){ addF(m.file); }); });
+      (src.inspections||[]).forEach(function(i){ (i.correctionEvidenceFiles||[]).forEach(addF); });
+      (src.materials||[]).forEach(function(m){ addF(m.file); });
+      L("첨부파일 " + paths.length + "개 복사 시작");
+      var ok = 0, fail = 0;
+      for (var i=0;i<paths.length;i++){
+        var p = paths[i];
+        var dl = await old.storage.from(O.bucket).download(p);
+        if (dl.error){ fail++; L("  ✗ 다운로드 실패: " + p + " (" + dl.error.message + ")"); continue; }
+        var target = /^attachments\//.test(p) ? p : ("attachments/imported/" + p);
+        var up = await sb.storage.from(STORAGE_BUCKET).upload(target, dl.data, { upsert:false, contentType: dl.data.type || undefined });
+        if (up.error && !/exists|Duplicate/i.test(up.error.message)){ fail++; L("  ✗ 업로드 실패: " + p + " (" + up.error.message + ")"); continue; }
+        if (target !== p) remapPath(src, p, target);
+        ok++; if (ok % 5 === 0) L("  … " + ok + "개 완료");
+      }
+      L("첨부파일 복사 완료: 성공 " + ok + " · 실패 " + fail);
+      // keep auto-created live rounds already in the dashboard
+      var liveRounds = (state.inspectionRounds||[]).filter(function(rd){ return rd.liveInspectionId; });
+      var merged = Object.assign({}, src);
+      merged.inspectionRounds = (src.inspectionRounds||[]).concat(liveRounds);
+      merged.meta = Object.assign({}, src.meta || {}, { title: TITLE });
+      var parts = splitState(merged);
+      for (var k in parts){
+        var u = await sb.from("app_state").update({ data: parts[k], updated_at: new Date().toISOString(), updated_by: currentUser.email }).eq("id", k).select("id");
+        if (u.error || !u.data || !u.data.length) throw new Error(k + " 저장 실패: " + ((u.error && u.error.message) || "권한 없음"));
+        L("저장 완료: " + SECTION_LABEL[k]);
+      }
+      await old.auth.signOut();
+      logAudit("admin", "import_legacy", "inspections " + (src.inspections||[]).length + ", files " + ok);
+      await loadStateFromServer();
+      L("가져오기가 끝났습니다. 리스크 관리대장에서 확인하세요.");
+    } catch(e){
+      L("오류: " + ((e && e.message) || e));
+    }
+    btn.disabled = false;
+  }
+  function remapPath(src, from, to){
+    function fix(f){ if (f && f.path === from) f.path = to; }
+    (src.inspectionRounds||[]).forEach(function(rd){ (rd.attachments||[]).forEach(fix); (rd.materials||[]).forEach(function(m){ fix(m.file); }); });
+    (src.inspections||[]).forEach(function(i){ (i.correctionEvidenceFiles||[]).forEach(fix); });
+    (src.materials||[]).forEach(function(m){ fix(m.file); });
   }
 
   /* ---------- boot ---------- */
