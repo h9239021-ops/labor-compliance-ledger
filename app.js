@@ -1073,6 +1073,12 @@
   var routing = false;
   window.addEventListener("hashchange", function(){
     if (routing || !MY) return;
+    if (activeTab === "manual" && manualEditing){
+      if (manualDirty && !confirm("수정 중인 매뉴얼을 저장하지 않고 이동할까요?")){
+        routing = true; history.replaceState(null, "", hashForState()); routing = false; return;
+      }
+      manualEditing = false; manualDirty = false;
+    }
     parseHash();
     render();
   });
@@ -2832,7 +2838,7 @@
       else {
         html += '<div class="scrollx"><table class="tbl"><thead><tr><th>감독</th><th>자료</th><th>마감</th><th>상태</th><th></th></tr></thead><tbody>' +
           mine.map(function(i){ var ins = LIVE.inspections.filter(function(x){ return x.id === i.inspection_id; })[0] || {};
-            return '<tr><td>' + esc(ins.title||"") + '</td><td>' + esc(i.title) + (i.reject_reason ? '<div class="hint" style="font-size:12px;color:var(--danger-700)">반려 사유: ' + esc(i.reject_reason) + '</div>' : '') + '</td><td class="mono">' + (i.due_date ? fmtDate(i.due_date) : "-") + '</td><td>' + statusBadge(i.status) + '</td><td><a class="btn sm" href="#/response/' + i.inspection_id + '">열기</a></td></tr>'; }).join("") +
+            return '<tr><td>' + esc(ins.title||"") + '</td><td class="resp-title">' + esc(i.title) + (i.reject_reason ? '<div class="hint wraptext" style="font-size:12px;color:var(--danger-700)">반려 사유: ' + esc(i.reject_reason) + '</div>' : '') + '</td><td class="mono">' + (i.due_date ? fmtDate(i.due_date) : "-") + '</td><td>' + statusBadge(i.status) + '</td><td><a class="btn sm" href="#/response/' + i.inspection_id + '">열기</a></td></tr>'; }).join("") +
           '</tbody></table></div>';
       }
       html += '</div>';
@@ -2907,13 +2913,23 @@
     var html = '<div class="doc-wrap"><article class="doc">';
     html += '<div class="crumb"><a href="#/home">대시보드</a><span>›</span><a href="#/manual/' + esc(MANUAL[0].id) + '">대응 매뉴얼</a><span>›</span><span>' + esc(page.grp) + '</span></div>';
     if (manualEditing && canEdit){
-      html += '<div class="doc-editor"><form class="f" id="manualEditForm">' +
-        '<label class="full">제목<input name="title" value="' + esc(page.title) + '"></label>' +
-        '<label class="full">요약<input name="lead" value="' + esc(page.lead||"") + '"></label>' +
-        '<label class="full">본문 (HTML)<textarea name="body_html">' + esc(page.body_html||"") + '</textarea></label>' +
-        '<label class="full">참고자료 번호 (쉼표로 구분, 예: 03,05)<input name="refs" value="' + esc((page.refs||[]).join(",")) + '"></label>' +
-        '<div class="form-actions"><button type="button" class="btn ghost sm" id="manualEditCancel">취소</button><button class="btn primary sm" type="submit">저장</button></div>' +
-      '</form></div>';
+      manualDirty = false;
+      html += '<div class="ed-bar" id="edBar">' +
+        edBtn("bold","<b>B</b> 굵게") + edBtn("red",'<span style="color:var(--danger-700);font-weight:700">빨강</span>') + edBtn("blue",'<span style="color:var(--accent-700);font-weight:700">파랑</span>') + edBtn("plain","강조 해제") +
+        '<span class="sep"></span>' + edBtn("h2","제목") + edBtn("h3","소제목") + edBtn("p","본문") +
+        '<span class="sep"></span>' + edBtn("ul","• 목록") + edBtn("ol","1. 번호") +
+        '<span class="sep"></span>' + edBtn("link","링크") + edBtn("unlink","링크 해제") + edBtn("note","안내 박스") +
+        '<span class="sep"></span>' + edBtn("rowAdd","표 행 추가") + edBtn("rowDel","표 행 삭제") +
+        '<span class="sep"></span>' + edBtn("undo","↶") + edBtn("redo","↷") +
+        '<span class="grow"></span>' + edBtn("html","HTML로 보기") +
+        '<button type="button" class="btn sm ghost" id="manualEditCancel">취소</button><button type="button" class="btn sm primary" id="manualEditSave">저장</button>' +
+      '</div>' +
+      '<p class="ed-hint">점선 영역을 클릭해 화면에 보이는 그대로 수정하세요. 표 칸, 카드, 안내 박스 안의 글도 바로 고칠 수 있습니다. 글자를 선택한 뒤 위 버튼으로 서식을 바꿉니다.</p>' +
+      '<h1 contenteditable="true" id="edTitle">' + esc(page.title) + '</h1>' +
+      '<p class="lead" contenteditable="true" id="edLead">' + esc(page.lead||"") + '</p>' +
+      '<div class="body" contenteditable="true" id="edBody">' + (page.body_html || "<p><br></p>") + '</div>' +
+      '<textarea class="ed-html" id="edHtml" style="display:none"></textarea>' +
+      '<div class="ed-refs"><span>참고자료 번호</span><input id="edRefs" value="' + esc((page.refs||[]).join(",")) + '" placeholder="쉼표로 구분, 예: 03,05"></div>';
     } else {
       html += '<h1>' + esc(page.title) + '</h1>' + (page.lead ? '<p class="lead">' + esc(page.lead) + '</p>' : '');
       html += '<div class="meta-line"><span class="tag b">대응 매뉴얼</span><span class="tag">' + esc(page.grp) + '</span>' +
@@ -2931,25 +2947,121 @@
     $all(".grp-h").forEach(function(b){ b.addEventListener("click", function(){ var g = b.parentNode; g.classList.toggle("open"); manualOpenGroups[g.getAttribute("data-grp")] = g.classList.contains("open"); }); });
     var on = document.querySelector(".grp li a.on"), side = document.getElementById("side");
     if (on && side) side.scrollTop = Math.max(0, on.offsetTop - 200);
-    buildRightToc(el);
+    if (!manualEditing) buildRightToc(el);
     var eb = document.getElementById("btnManualEdit");
     if (eb) eb.addEventListener("click", function(){ manualEditing = true; renderManual(); });
-    var cf = document.getElementById("manualEditCancel");
-    if (cf) cf.addEventListener("click", function(){ manualEditing = false; renderManual(); });
-    var mf = document.getElementById("manualEditForm");
-    if (mf) mf.addEventListener("submit", async function(e){
-      e.preventDefault();
-      var fd = new FormData(mf);
-      var upd = { title: fd.get("title"), lead: fd.get("lead"), body_html: fd.get("body_html"),
-        refs: String(fd.get("refs")||"").split(",").map(function(s){ return s.trim(); }).filter(Boolean),
+    if (manualEditing && canEdit) wireManualEditor(page);
+    window.scrollTo(0,0);
+  }
+
+  /* ---------- manual WYSIWYG editor ---------- */
+  var manualDirty = false;
+  function edBtn(cmd, label){ return '<button type="button" data-ed="' + cmd + '" title="' + label.replace(/<[^>]+>/g,"") + '">' + label + '</button>'; }
+  function cleanHtml(html){
+    var t = document.createElement("template");
+    t.innerHTML = html || "";
+    t.content.querySelectorAll("script,style,iframe,object,embed,form,input,textarea,button").forEach(function(n){ n.remove(); });
+    t.content.querySelectorAll("*").forEach(function(n){
+      Array.prototype.slice.call(n.attributes).forEach(function(a){
+        var nm = a.name.toLowerCase();
+        if (nm.indexOf("on") === 0 || nm === "contenteditable" || nm === "style" && /expression|url\(/i.test(a.value)) n.removeAttribute(a.name);
+        if ((nm === "href" || nm === "src") && /^\s*javascript:/i.test(a.value)) n.removeAttribute(a.name);
+      });
+    });
+    return t.innerHTML.trim();
+  }
+  function wireManualEditor(page){
+    var body = document.getElementById("edBody"), htmlBox = document.getElementById("edHtml");
+    var title = document.getElementById("edTitle"), lead = document.getElementById("edLead");
+    var htmlMode = false;
+    try { document.execCommand("styleWithCSS", false, false); document.execCommand("defaultParagraphSeparator", false, "p"); } catch(e){}
+    [body, title, lead].forEach(function(x){ x.addEventListener("input", function(){ manualDirty = true; }); });
+    htmlBox.addEventListener("input", function(){ manualDirty = true; });
+    // single-line fields: Enter must not create new blocks
+    [title, lead].forEach(function(x){ x.addEventListener("keydown", function(e){ if (e.key === "Enter"){ e.preventDefault(); } }); });
+    // summaries inside the body must not toggle while editing text
+    body.addEventListener("click", function(e){ var s = e.target.closest && e.target.closest("summary"); if (s && e.target === s && e.offsetX > 40) e.preventDefault(); });
+    body.addEventListener("click", function(e){ var a = e.target.closest && e.target.closest("a"); if (a) e.preventDefault(); });
+
+    function selRange(){ var s = window.getSelection(); return s && s.rangeCount ? s.getRangeAt(0) : null; }
+    function inBody(node){ return node && (node === body || body.contains(node)); }
+    function wrapSpan(cls){
+      var r = selRange(); if (!r || r.collapsed || !inBody(r.commonAncestorContainer)){ alert("먼저 바꿀 글자를 선택하세요."); return; }
+      var span = document.createElement("span"); if (cls) span.className = cls;
+      span.appendChild(r.extractContents()); r.insertNode(span);
+      manualDirty = true;
+    }
+    function unwrapColor(){
+      var r = selRange(); if (!r) return;
+      var n = r.commonAncestorContainer; n = n.nodeType === 3 ? n.parentNode : n;
+      var sp = n.closest && n.closest("span.red, span.blue, b.red, b.blue, td.red, td.blue");
+      if (sp && inBody(sp)){
+        if (sp.tagName === "TD"){ sp.classList.remove("red","blue"); }
+        else { while (sp.firstChild) sp.parentNode.insertBefore(sp.firstChild, sp); sp.remove(); }
+        manualDirty = true;
+      }
+    }
+    function curRow(){ var r = selRange(); if (!r) return null; var n = r.startContainer; n = n.nodeType === 3 ? n.parentNode : n; var tr = n.closest && n.closest("tr"); return tr && inBody(tr) ? tr : null; }
+    var actions = {
+      bold: function(){ document.execCommand("bold"); },
+      red: function(){ wrapSpan("red"); }, blue: function(){ wrapSpan("blue"); }, plain: unwrapColor,
+      h2: function(){ document.execCommand("formatBlock", false, "h2"); }, h3: function(){ document.execCommand("formatBlock", false, "h3"); }, p: function(){ document.execCommand("formatBlock", false, "p"); },
+      ul: function(){ document.execCommand("insertUnorderedList"); }, ol: function(){ document.execCommand("insertOrderedList"); },
+      link: function(){
+        var r = selRange(); if (!r || r.collapsed){ alert("링크를 걸 글자를 먼저 선택하세요."); return; }
+        var saved = r.cloneRange();
+        openTextModal("링크 넣기", "주소를 입력하세요. 대시보드 안 문서는 #/manual/문서ID 형식도 됩니다.", "https://", false, function(url){
+          if (!url) return; var s = window.getSelection(); s.removeAllRanges(); s.addRange(saved);
+          document.execCommand("createLink", false, url.trim()); manualDirty = true; });
+      },
+      unlink: function(){ document.execCommand("unlink"); },
+      note: function(){ document.execCommand("insertHTML", false, '<div class="note info"><span class="nt">안내</span>내용을 입력하세요.</div><p><br></p>'); },
+      rowAdd: function(){ var tr = curRow(); if (!tr){ alert("표 안의 칸을 먼저 클릭하세요."); return; }
+        var n = tr.cloneNode(true); n.querySelectorAll("td,th").forEach(function(c){ c.innerHTML = "<br>"; }); tr.parentNode.insertBefore(n, tr.nextSibling); manualDirty = true; },
+      rowDel: function(){ var tr = curRow(); if (!tr){ alert("지울 행의 칸을 먼저 클릭하세요."); return; }
+        if (tr.parentNode.tagName === "THEAD"){ alert("머리글 행은 지울 수 없습니다."); return; }
+        if (confirm("이 행을 삭제할까요?")){ tr.remove(); manualDirty = true; } },
+      undo: function(){ document.execCommand("undo"); }, redo: function(){ document.execCommand("redo"); },
+      html: function(){
+        htmlMode = !htmlMode;
+        if (htmlMode){ htmlBox.value = cleanHtml(body.innerHTML); body.style.display = "none"; htmlBox.style.display = "block"; }
+        else { body.innerHTML = cleanHtml(htmlBox.value); htmlBox.style.display = "none"; body.style.display = ""; }
+        $all('#edBar [data-ed]').forEach(function(b){ if (b.getAttribute("data-ed") !== "html") b.disabled = htmlMode; });
+        document.querySelector('#edBar [data-ed="html"]').textContent = htmlMode ? "화면으로 보기" : "HTML로 보기";
+      }
+    };
+    $all("#edBar [data-ed]").forEach(function(b){
+      b.addEventListener("mousedown", function(e){ e.preventDefault(); }); // keep the text selection
+      b.addEventListener("click", function(){ var f = actions[b.getAttribute("data-ed")]; if (f){ if (b.getAttribute("data-ed") !== "html") body.focus(); f(); } });
+    });
+    document.getElementById("manualEditCancel").addEventListener("click", function(){
+      if (manualDirty && !confirm("수정한 내용을 저장하지 않고 닫을까요?")) return;
+      manualEditing = false; manualDirty = false; renderManual();
+    });
+    document.getElementById("manualEditSave").addEventListener("click", async function(){
+      var bodyHtml = cleanHtml(htmlMode ? htmlBox.value : body.innerHTML);
+      var upd = { title: title.textContent.trim() || page.title, lead: lead.textContent.trim(), body_html: bodyHtml,
+        refs: String(document.getElementById("edRefs").value||"").split(",").map(function(s){ return s.trim(); }).filter(Boolean),
         updated_at: new Date().toISOString(), updated_by: currentUser.email };
+      var btn = document.getElementById("manualEditSave"); btn.disabled = true;
       var r = await sb.from("manual_pages").update(upd).eq("id", page.id).select("id");
+      btn.disabled = false;
       if (r.error || !r.data || !r.data.length){ alert("저장하지 못했습니다: " + ((r.error && r.error.message) || "권한이 없습니다.")); return; }
       Object.assign(page, upd);
       logAudit("manual", "edit", page.title);
-      manualEditing = false; toast("매뉴얼이 저장되었습니다."); render();
+      manualEditing = false; manualDirty = false; toast("매뉴얼이 저장되었습니다."); render();
     });
-    window.scrollTo(0,0);
+    title.focus();
+  }
+
+  // Multi-line text input in a modal (replaces window.prompt so long text wraps)
+  function openTextModal(heading, hint, value, multiline, onOk){
+    showModal('<h3>' + esc(heading) + '</h3>' + (hint ? '<p class="hint">' + esc(hint) + '</p>' : '') +
+      (multiline ? '<textarea id="tmInput" rows="5">' + esc(value||"") + '</textarea>' : '<input id="tmInput" value="' + esc(value||"") + '">') +
+      '<div class="modal-actions"><button type="button" class="btn ghost" id="tmCancel">취소</button><button type="button" class="btn primary" id="tmOk">확인</button></div>', true);
+    var inp = document.getElementById("tmInput"); inp.focus();
+    document.getElementById("tmCancel").addEventListener("click", closeModal);
+    document.getElementById("tmOk").addEventListener("click", function(){ var v = inp.value; closeModal(); onOk(v); });
   }
   function buildRightToc(root){
     var host = document.getElementById("tocR"); if (!host) return;
@@ -3064,8 +3176,8 @@
             (fin ? '<div>✅ ' + fileLink(fin) + ' <span class="badge good">최종 v' + fin.version + '</span></div>' : '') +
             (last && (!fin || last.id !== fin.id) ? '<div>' + fileLink(last) + ' <span class="badge neutral">v' + last.version + '</span>' + (canManage ? ' <button class="btn sm" data-final="' + last.id + '">최종 확정</button>' : '') + '</div>' : '') +
             (fs.length > 1 ? '<details style="margin-top:4px"><summary class="hint" style="cursor:pointer;font-size:12px">이전 버전 ' + (fs.length) + '개</summary>' + fs.map(function(f){ return '<div style="font-size:12px">v' + f.version + ' · ' + fileLink(f) + ' · ' + esc(userLabel(f.uploaded_by)) + ' · ' + fmtDate(f.uploaded_at) + (f.comment ? ' · ' + esc(f.comment) : '') + (canManage && !f.is_final ? ' <button class="btn sm" data-final="' + f.id + '">이 버전 확정</button>' : '') + '</div>'; }).join("") + '</details>' : '');
-          return '<tr><td class="mono">' + esc(i.no||"") + '</td><td><b>' + esc(i.title) + '</b><div class="hint" style="font-size:12px">' + esc([i.period, i.form].filter(Boolean).join(" · ")) + ' · 관리대장 구분: ' + esc(i.ledger_kind) + '</div>' +
-              (i.note ? '<div style="font-size:12px;margin-top:2px">💬 ' + esc(i.note) + '</div>' : '') + (i.reject_reason ? '<div style="font-size:12px;color:var(--danger-700)">반려: ' + esc(i.reject_reason) + '</div>' : '') + '</td>' +
+          return '<tr><td class="mono">' + esc(i.no||"") + '</td><td class="resp-title"><b>' + esc(i.title) + '</b><div class="hint" style="font-size:12px">' + esc([i.period, i.form].filter(Boolean).join(" · ")) + ' · 관리대장 구분: ' + esc(i.ledger_kind) + '</div>' +
+              (i.note ? '<div class="wraptext" style="font-size:12px;margin-top:2px">💬 ' + esc(i.note) + '</div>' : '') + (i.reject_reason ? '<div class="wraptext" style="font-size:12px;color:var(--danger-700);margin-top:2px">반려: ' + esc(i.reject_reason) + '</div>' : '') + '</td>' +
             '<td>' + assignCell + '</td><td>' + dueCell + '</td><td>' + statusBadge(i.status) + '</td><td style="min-width:220px">' + filesCell + '</td>' +
             '<td style="white-space:nowrap">' + (canUp ? '<button class="btn sm primary" data-upload="' + i.id + '">업로드</button> ' : '') +
               (canUp ? '<button class="btn sm" data-note="' + i.id + '">메모</button> ' : '') +
@@ -3095,19 +3207,19 @@
       var r = await sb.rpc("finalize_file", { p_file: b.getAttribute("data-final") });
       if (r.error){ alert(r.error.message); return; }
       await loadLive(); toast("최종본으로 확정되었습니다."); renderResponse(); }); });
-    $all("[data-reject]", el).forEach(function(b){ b.addEventListener("click", async function(){
-      var reason = prompt("반려 사유를 입력하세요 (담당자에게 표시됩니다)");
-      if (reason === null) return;
-      var r = await sb.rpc("reject_item", { p_item: b.getAttribute("data-reject"), p_reason: reason });
-      if (r.error){ alert(r.error.message); return; }
-      await loadLive(); renderResponse(); }); });
-    $all("[data-note]", el).forEach(function(b){ b.addEventListener("click", async function(){
+    $all("[data-reject]", el).forEach(function(b){ b.addEventListener("click", function(){
+      var itemId = b.getAttribute("data-reject");
+      openTextModal("반려 사유", "담당자에게 표시됩니다. 무엇을 고쳐서 다시 올려야 하는지 적어 주세요.", "", true, async function(reason){
+        if (!String(reason||"").trim()){ alert("반려 사유를 입력하세요."); return; }
+        var r = await sb.rpc("reject_item", { p_item: itemId, p_reason: reason.trim() });
+        if (r.error){ alert(r.error.message); return; }
+        await loadLive(); renderResponse(); }); }); });
+    $all("[data-note]", el).forEach(function(b){ b.addEventListener("click", function(){
       var it = LIVE.items.filter(function(x){ return x.id === b.getAttribute("data-note"); })[0];
-      var v = prompt("메모 (진행 상황, 특이사항)", (it && it.note) || "");
-      if (v === null) return;
-      var r = await sb.rpc("set_item_note", { p_item: it.id, p_note: v });
-      if (r.error){ alert(r.error.message); return; }
-      await loadLive(); renderResponse(); }); });
+      openTextModal("메모", "진행 상황이나 특이사항을 적어 주세요.", (it && it.note) || "", true, async function(v){
+        var r = await sb.rpc("set_item_note", { p_item: it.id, p_note: v });
+        if (r.error){ alert(r.error.message); return; }
+        await loadLive(); renderResponse(); }); }); });
     $all("[data-assign]", el).forEach(function(s){ s.addEventListener("change", async function(){
       var r = await sb.from("collect_items").update({ assignee_email: s.value || null, updated_at: new Date().toISOString() }).eq("id", s.getAttribute("data-assign"));
       if (r.error){ alert(r.error.message); return; } await loadLive(); toast("담당자가 지정되었습니다."); }); });
